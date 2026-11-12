@@ -6,8 +6,12 @@
 
 #![deny(missing_docs)]
 
+pub mod admin;
 pub mod auth;
 pub mod config;
+pub mod event_contract;
+pub mod kinesis_consumer;
+pub mod security_event;
 pub mod wiring;
 
 /// Starts the service: loads [`config::Config`] from the environment, builds

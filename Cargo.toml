@@ -4,15 +4,31 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal"] }
 axum = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 secrecy = "0.10.3"
 thiserror = "2.0"
 subtle = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-trait = "0.1"
+# `stream::unfold` builds the SSE stream of `GET /events`.
+futures-util = "0.3"
+# `CancellationToken` is the cooperative shutdown signal of the consumer.
+tokio-util = "0.7"
+time = { version = "0.3", features = ["formatting", "parsing"] }
+aws-config = { version = "1.12.0", features = ["behavior-version-latest"] }
+# Same version requirement as the gateway. The lock resolves newer compatible
+# releases: the older ones do not build together with a fresh aws-config.
+aws-sdk-kinesis = "1.125.0"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }
 http = "1"
+testcontainers = "0.20"
+# Validates the hand-coded event validator against the broker JSON schema
+# (`tests/admin_event_contract.rs`); same version and features as the broker.
+jsonschema = { version = "0.56", default-features = false }
