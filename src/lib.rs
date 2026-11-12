@@ -179,6 +179,13 @@ mod tests {
         async fn latest_iterator(&self, _shard_id: &str) -> Result<String, SourceError> {
             Ok("it".to_string())
         }
+        async fn at_timestamp_iterator(
+            &self,
+            _shard_id: &str,
+            _timestamp_ms: i64,
+        ) -> Result<String, SourceError> {
+            Ok("it".to_string())
+        }
         async fn get_records(&self, iterator: &str) -> Result<RecordsBatch, SourceError> {
             Ok(RecordsBatch {
                 records: vec![],

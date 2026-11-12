@@ -1,7 +1,7 @@
 //! End-to-end test of the admin feed against a real LocalStack started with
 //! `testcontainers` (no mocks, no AWS account): events put on the Kinesis
 //! stream are read by the consumer (`AwsRecordsSource` +
-//! `SecurityEventConsumer`, `GetShardIterator(LATEST)` + `GetRecords`) and
+//! `SecurityEventConsumer`, `GetShardIterator` + `GetRecords`) and
 //! reflected by `GET /metrics` of the real router. A garbage record is also
 //! put and counted.
 //!
@@ -73,6 +73,71 @@ fn event(
     serde_json::to_vec(&event).unwrap()
 }
 
+fn now_rfc3339() -> String {
+    time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap()
+}
+
+/// Restart scenario: records published while no consumer was running are
+/// read by a NEW consumer (warm start, `AT_TIMESTAMP` 15 minutes back).
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn a_new_consumer_recovers_the_events_published_before_it_started() {
+    let localstack = common::LocalStack::start().await;
+    localstack.create_stream(STREAM).await;
+    let at = now_rfc3339();
+    for (id, actor) in [(1, "admin-1"), (2, "admin-2")] {
+        put(
+            &localstack,
+            "restart",
+            event(id, "auth.login", &at, Some(actor), None, json!({})),
+        )
+        .await;
+    }
+    put(
+        &localstack,
+        "restart",
+        event(
+            3,
+            "scan.failed",
+            &at,
+            None,
+            Some("scan-restart"),
+            json!({"reason_code": "ssh_timeout"}),
+        ),
+    )
+    .await;
+
+    // The "restarted" instance: nothing was seen before this point.
+    let aggregator = Arc::new(AdminAggregator::new(Arc::new(SystemClock)));
+    let shutdown = CancellationToken::new();
+    let consumer = SecurityEventConsumer::new(
+        Arc::new(AwsRecordsSource::from_client(
+            localstack.kinesis.clone(),
+            STREAM.to_string(),
+        )),
+        aggregator.clone(),
+    );
+    let consumer_task = tokio::spawn(consumer.run(shutdown.clone()));
+
+    wait_until(
+        "the pre-start events are replayed",
+        Duration::from_secs(30),
+        || aggregator.snapshot().recent_events.len() == 3,
+    )
+    .await;
+    let kpis = aggregator.snapshot().kpis;
+    assert_eq!(kpis.active_users, 2);
+    assert_eq!(kpis.failed_last_window, 1);
+
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(10), consumer_task)
+        .await
+        .expect("the consumer must stop")
+        .expect("no panic");
+}
+
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn events_published_to_kinesis_reach_the_metrics_endpoint() {
@@ -100,9 +165,8 @@ async fn events_published_to_kinesis_reach_the_metrics_endpoint() {
     );
     let consumer_task = tokio::spawn(consumer.run(shutdown.clone()));
 
-    // The consumer starts at LATEST: what is published before it takes its
-    // iterator is not seen. A probe (no effect on the KPIs) is published
-    // until it shows up in the log.
+    // A probe (no effect on the KPIs) is published until it shows up in the
+    // log, so the consumer is known to be reading before the real events go.
     let ready_deadline = Instant::now() + Duration::from_secs(30);
     let mut probe_id = 900;
     while aggregator.snapshot().recent_events.is_empty() {

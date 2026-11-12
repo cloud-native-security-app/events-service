@@ -5,11 +5,15 @@
 //! ## Decisiones de diseño
 //!
 //! - **Lectura directa, sin KCL**: `ListShards`, y por shard
-//!   `GetShardIterator(LATEST)` + `GetRecords`. Cada instancia del servicio
-//!   lee todos los eventos (el panel es una vista en vivo, no un registro de
+//!   `GetShardIterator` + `GetRecords`. Cada instancia del servicio lee todos
+//!   los eventos (el panel es una vista en vivo, no un registro de
 //!   auditoría), así que no hay checkpoints ni coordinación entre
-//!   instancias. Consecuencia aceptada: lo publicado mientras una instancia
-//!   estaba caída no aparece en ella.
+//!   instancias.
+//! - **Arranque en caliente**: el primer iterador de cada worker es
+//!   `AT_TIMESTAMP` a `now - WINDOW_SECS` (15 min, hora del reloj del
+//!   agregador), así que tras un reinicio el panel recupera la ventana. El
+//!   solapamiento con lo ya visto lo absorbe el dedupe por `event_id` del
+//!   agregador. Un shard hijo tras un resharding también arranca así.
 //! - **Puerto [`RecordsSource`]**: el bucle no conoce AWS. [`AwsRecordsSource`]
 //!   es el adaptador real; los tests usan una fuente falsa y el reloj pausado
 //!   de `tokio`, sin esperas reales.
@@ -17,7 +21,8 @@
 //!   listar: un shard nuevo (resharding) recibe su worker, y uno cerrado
 //!   (`next_iterator` ausente) termina el suyo.
 //! - **Iterador vencido**: no es un error; el worker vuelve a tomar `LATEST`
-//!   (lo ocurrido en el hueco se pierde, se loggea un `warn`).
+//!   (no `AT_TIMESTAMP`: lo ocurrido en el hueco se pierde, se loggea un
+//!   `warn`).
 //! - **Errores**: backoff exponencial de [`BACKOFF_INITIAL`] a [`BACKOFF_MAX`]
 //!   (mismas constantes que el consumidor SQS), reiniciado tras un éxito. Los
 //!   errores se loggean con su cadena de causas, nunca con el cuerpo de un
@@ -41,7 +46,7 @@ use aws_sdk_kinesis::Client;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::admin::AdminAggregator;
+use crate::admin::{AdminAggregator, WINDOW_SECS};
 use crate::event_contract::parse_record;
 
 /// Espera entre sondeos de `GetRecords` de un mismo shard (el límite de
@@ -84,6 +89,13 @@ pub trait RecordsSource: Send + Sync {
     async fn list_open_shards(&self) -> Result<Vec<String>, SourceError>;
     /// Iterador que empieza en el registro más nuevo (`LATEST`) de `shard_id`.
     async fn latest_iterator(&self, shard_id: &str) -> Result<String, SourceError>;
+    /// Iterador que empieza en el primer registro con marca de tiempo de
+    /// llegada >= `timestamp_ms` (`AT_TIMESTAMP`, milisegundos Unix).
+    async fn at_timestamp_iterator(
+        &self,
+        shard_id: &str,
+        timestamp_ms: i64,
+    ) -> Result<String, SourceError>;
     /// Lee un lote desde `iterator`.
     async fn get_records(&self, iterator: &str) -> Result<RecordsBatch, SourceError>;
 }
@@ -172,8 +184,9 @@ impl SecurityEventConsumer {
     }
 }
 
-/// Bucle de un shard: toma `LATEST`, sondea siguiendo `next_iterator` y, si el
-/// iterador vence, vuelve a tomar `LATEST`.
+/// Bucle de un shard: la primera vez toma `AT_TIMESTAMP` a `now - WINDOW_SECS`
+/// (arranque en caliente), sondea siguiendo `next_iterator` y, si el iterador
+/// vence, vuelve a tomar `LATEST`.
 async fn run_shard(
     source: Arc<dyn RecordsSource>,
     aggregator: Arc<AdminAggregator>,
@@ -181,16 +194,20 @@ async fn run_shard(
     shutdown: CancellationToken,
 ) {
     let mut backoff = BACKOFF_INITIAL;
+    let mut warm_start = true;
     'acquire: loop {
         let mut iterator = loop {
             let result = tokio::select! {
                 () = shutdown.cancelled() => return,
-                result = source.latest_iterator(&shard_id) => result,
+                result = acquire_iterator(&*source, &aggregator, &shard_id, warm_start) => result,
             };
             match result {
-                Ok(iterator) => break iterator,
+                Ok(iterator) => {
+                    warm_start = false;
+                    break iterator;
+                }
                 Err(error) => {
-                    log_source_error(&error, backoff, "error tomando el iterador LATEST");
+                    log_source_error(&error, backoff, "error tomando el iterador del shard");
                     if !sleep_or_shutdown(backoff, &shutdown).await {
                         return;
                     }
@@ -235,6 +252,22 @@ async fn run_shard(
                 }
             }
         }
+    }
+}
+
+/// Primer iterador de un worker: `AT_TIMESTAMP` a `now - WINDOW_SECS` según el
+/// reloj del agregador; los siguientes (tras un iterador vencido): `LATEST`.
+async fn acquire_iterator(
+    source: &dyn RecordsSource,
+    aggregator: &AdminAggregator,
+    shard_id: &str,
+    warm_start: bool,
+) -> Result<String, SourceError> {
+    if warm_start {
+        let since_ms = aggregator.now_ms() - WINDOW_SECS as i64 * 1000;
+        source.at_timestamp_iterator(shard_id, since_ms).await
+    } else {
+        source.latest_iterator(shard_id).await
     }
 }
 
@@ -356,6 +389,28 @@ impl RecordsSource for AwsRecordsSource {
             .ok_or_else(|| SourceError::Failed("Kinesis no devolvió un iterador".into()))
     }
 
+    async fn at_timestamp_iterator(
+        &self,
+        shard_id: &str,
+        timestamp_ms: i64,
+    ) -> Result<String, SourceError> {
+        let output = self
+            .client
+            .get_shard_iterator()
+            .stream_name(&self.stream_name)
+            .shard_id(shard_id)
+            .shard_iterator_type(ShardIteratorType::AtTimestamp)
+            .timestamp(aws_sdk_kinesis::primitives::DateTime::from_millis(
+                timestamp_ms,
+            ))
+            .send()
+            .await
+            .map_err(|e| SourceError::Failed(DisplayErrorContext(e).to_string().into()))?;
+        output
+            .shard_iterator
+            .ok_or_else(|| SourceError::Failed("Kinesis no devolvió un iterador".into()))
+    }
+
     async fn get_records(&self, iterator: &str) -> Result<RecordsBatch, SourceError> {
         let output = self
             .client
@@ -403,7 +458,7 @@ mod tests {
         list_errors: Mutex<usize>,
         script: Mutex<VecDeque<Result<RecordsBatch, SourceError>>>,
         calls: Mutex<Vec<(String, Instant)>>,
-        latest_counter: Mutex<u32>,
+        iterator_counter: Mutex<u32>,
     }
 
     impl FakeSource {
@@ -455,9 +510,20 @@ mod tests {
 
         async fn latest_iterator(&self, shard_id: &str) -> Result<String, SourceError> {
             self.log(format!("latest:{shard_id}"));
-            let mut counter = self.latest_counter.lock().unwrap();
+            let mut counter = self.iterator_counter.lock().unwrap();
             *counter += 1;
             Ok(format!("latest-{counter}"))
+        }
+
+        async fn at_timestamp_iterator(
+            &self,
+            shard_id: &str,
+            timestamp_ms: i64,
+        ) -> Result<String, SourceError> {
+            self.log(format!("at:{shard_id}:{timestamp_ms}"));
+            let mut counter = self.iterator_counter.lock().unwrap();
+            *counter += 1;
+            Ok(format!("at-{counter}"))
         }
 
         async fn get_records(&self, iterator: &str) -> Result<RecordsBatch, SourceError> {
@@ -498,9 +564,7 @@ mod tests {
     }
 
     fn start(source: Arc<FakeSource>) -> Harness {
-        let aggregator = Arc::new(AdminAggregator::new(Arc::new(ManualClock::new(
-            1_800_000_000_000,
-        ))));
+        let aggregator = Arc::new(AdminAggregator::new(Arc::new(ManualClock::new(NOW_MS))));
         let shutdown = CancellationToken::new();
         let consumer = SecurityEventConsumer::new(source.clone(), aggregator.clone());
         let task = tokio::spawn(consumer.run(shutdown.clone()));
@@ -512,6 +576,14 @@ mod tests {
         }
     }
 
+    /// Instante del reloj inyectado en [`start`] y su ventana de arranque.
+    const NOW_MS: i64 = 1_800_000_000_000;
+    const WARM_START_MS: i64 = NOW_MS - 900_000;
+
+    fn at_call(shard: &str) -> String {
+        format!("at:{shard}:{WARM_START_MS}")
+    }
+
     /// Deja correr el tiempo virtual `secs` segundos (el reloj está pausado y
     /// avanza solo cuando todas las tareas están inactivas).
     async fn run_for(secs: u64) {
@@ -519,7 +591,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn starts_at_latest_follows_the_next_iterator_and_feeds_the_aggregator() {
+    async fn first_iterator_is_at_timestamp_fifteen_minutes_back_and_feeds_the_aggregator() {
         let source = FakeSource::with_shards(&["shard-1"]);
         source.push(batch(vec![login_record(1), login_record(2)], "it-2"));
         let h = start(source);
@@ -529,8 +601,9 @@ mod tests {
         let names = h.source.names();
         assert_eq!(
             &names[..4],
-            ["list", "latest:shard-1", "get:latest-1", "get:it-2"]
+            ["list", &at_call("shard-1"), "get:at-1", "get:it-2"]
         );
+        assert!(!names.iter().any(|n| n.starts_with("latest:")));
         let snapshot = h.aggregator.snapshot();
         assert_eq!(snapshot.kpis.active_users, 2);
         assert_eq!(snapshot.recent_events.len(), 2);
@@ -578,7 +651,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn an_expired_iterator_reacquires_latest() {
+    async fn an_expired_iterator_reacquires_latest_not_the_warm_start_timestamp() {
         let source = FakeSource::with_shards(&["shard-1"]);
         source.push(Err(SourceError::IteratorExpired));
         source.push(batch(vec![login_record(1)], "it-after"));
@@ -591,8 +664,8 @@ mod tests {
             &names[..5],
             [
                 "list",
-                "latest:shard-1",
-                "get:latest-1",
+                &at_call("shard-1"),
+                "get:at-1",
                 "latest:shard-1",
                 "get:latest-2"
             ]
@@ -640,15 +713,15 @@ mod tests {
 
         run_for(SHARD_REFRESH.as_secs() + 5).await;
 
-        let latest = h
+        let warm = h
             .source
             .names()
             .iter()
-            .filter(|n| n.starts_with("latest:"))
+            .filter(|n| **n == at_call("shard-1"))
             .count();
         assert_eq!(
-            latest, 2,
-            "tras cerrarse, el refresco vuelve a tomar LATEST"
+            warm, 2,
+            "un worker nuevo del mismo shard arranca otra vez con AT_TIMESTAMP"
         );
         assert_eq!(h.aggregator.snapshot().recent_events.len(), 1);
     }
@@ -663,8 +736,14 @@ mod tests {
         run_for(SHARD_REFRESH.as_secs() + 2).await;
 
         let names = h.source.names();
-        assert_eq!(names.iter().filter(|n| *n == "latest:shard-1").count(), 1);
-        assert_eq!(names.iter().filter(|n| *n == "latest:shard-2").count(), 1);
+        assert_eq!(
+            names.iter().filter(|n| **n == at_call("shard-1")).count(),
+            1
+        );
+        assert_eq!(
+            names.iter().filter(|n| **n == at_call("shard-2")).count(),
+            1
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -678,7 +757,7 @@ mod tests {
         let lists = h.source.times_of("list");
         assert_eq!((lists[1] - lists[0]).as_secs(), 1);
         assert_eq!((lists[2] - lists[1]).as_secs(), 2);
-        assert!(h.source.names().contains(&"latest:shard-1".to_string()));
+        assert!(h.source.names().contains(&at_call("shard-1")));
     }
 
     #[tokio::test(start_paused = true)]

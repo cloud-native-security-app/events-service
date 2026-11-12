@@ -460,6 +460,11 @@ impl AdminAggregator {
         }
     }
 
+    /// Instante actual según el reloj inyectado (ms desde la época Unix).
+    pub fn now_ms(&self) -> i64 {
+        self.clock.now_ms()
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.inner
             .lock()
