@@ -548,7 +548,7 @@ mod tests {
         serde_json::to_vec(&serde_json::json!({
             "event_id": format!("00000000-0000-4000-8000-{n:012}"),
             "event_type": "auth.login",
-            "occurred_at": "2026-11-10T12:00:00Z",
+            "occurred_at": crate::admin::rfc3339_from_ms(NOW_MS),
             "source": "gateway",
             "actor_sub": format!("user-{n}"),
             "payload": {}

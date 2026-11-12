@@ -12,9 +12,20 @@
 //!
 //! - **Puro y con reloj inyectado**: el agregador no llama a `SystemTime`;
 //!   recibe un [`Clock`]. Los tests usan [`ManualClock`] y no duermen.
-//! - **La ventana usa la hora de recepción, no `occurred_at`**: un productor
-//!   con el reloj desfasado (o malicioso) no puede meter ni sacar eventos de
-//!   la ventana. `occurred_at` se muestra tal cual en el registro.
+//! - **La ventana usa `occurred_at`, no la hora de recepción**: tras un
+//!   reinicio el consumidor reproduce los últimos 15 minutos
+//!   ([`crate::kinesis_consumer`]) y cada evento debe caer en su minuto real.
+//!   Los KPIs de ventana (completados, fallidos, límites de tasa, usuarios
+//!   activos) cuentan solo eventos con `occurred_at` dentro de [`WINDOW_SECS`];
+//!   uno más viejo no cuenta (el contador es una ventana, no un total). El
+//!   registro reciente y los hallazgos críticos sí ingieren lo reproducido, y
+//!   un escaneo en curso nace con la hora del evento (un `scan.requested`
+//!   reproducido seguido de su `scan.completed` no deja un escaneo fantasma, y
+//!   uno de hace más de una hora vence de inmediato). Un `occurred_at` futuro
+//!   (reloj desfasado) se acota a la hora actual; uno no interpretable usa la
+//!   hora de recepción (el contrato solo valida su forma; no es un registro
+//!   malformado). Un productor con el reloj atrasado puede dejar eventos
+//!   fuera de la ventana: es el costo aceptado de usar la hora del evento.
 //! - **Memoria acotada**: contadores por cubetas de un segundo (a lo sumo
 //!   [`WINDOW_SECS`] entradas), escaneos en curso con tope y vencimiento,
 //!   usuarios activos con tope, hallazgos y registro con tope, y un conjunto
@@ -246,11 +257,17 @@ struct WindowCounter {
 }
 
 impl WindowCounter {
-    fn add(&mut self, now_ms: i64) {
-        let sec = now_ms.div_euclid(1000);
-        match self.buckets.back_mut() {
-            Some((last, count)) if *last == sec => *count += 1,
-            _ => self.buckets.push_back((sec, 1)),
+    /// Cuenta un evento ocurrido en `at_ms` (ya acotado a `now_ms`). Uno fuera
+    /// de la ventana no cuenta; uno desordenado va a su cubeta, no al final.
+    fn add(&mut self, at_ms: i64, now_ms: i64) {
+        let sec = at_ms.div_euclid(1000);
+        if sec <= now_ms.div_euclid(1000) - WINDOW_SECS as i64 {
+            return;
+        }
+        let idx = self.buckets.partition_point(|(bucket, _)| *bucket < sec);
+        match self.buckets.get_mut(idx) {
+            Some((bucket, count)) if *bucket == sec => *count += 1,
+            _ => self.buckets.insert(idx, (sec, 1)),
         }
     }
 
@@ -333,7 +350,7 @@ impl State {
         false
     }
 
-    fn track_scan(&mut self, scan_id: &str, status: ScanFlightStatus, now_ms: i64) -> ScanChange {
+    fn track_scan(&mut self, scan_id: &str, status: ScanFlightStatus, at_ms: i64) -> ScanChange {
         if let Some(existing) = self.in_flight.get_mut(scan_id) {
             // Un `scan.requested` tardío o repetido no degrada a `running`.
             if status == ScanFlightStatus::Running {
@@ -359,7 +376,7 @@ impl State {
             scan_id.to_string(),
             InFlightEntry {
                 status,
-                since_ms: now_ms,
+                since_ms: at_ms,
             },
         );
         ScanChange {
@@ -368,7 +385,7 @@ impl State {
         }
     }
 
-    fn login(&mut self, actor: &str, now_ms: i64) {
+    fn login(&mut self, actor: &str, at_ms: i64, now_ms: i64) {
         if self.active_users.len() >= MAX_ACTIVE_USERS && !self.active_users.contains_key(actor) {
             self.prune(now_ms);
             if self.active_users.len() >= MAX_ACTIVE_USERS {
@@ -382,7 +399,9 @@ impl State {
                 }
             }
         }
-        self.active_users.insert(actor.to_string(), now_ms);
+        let latest = self.active_users.get(actor).copied().unwrap_or(i64::MIN);
+        self.active_users
+            .insert(actor.to_string(), latest.max(at_ms));
     }
 }
 
@@ -395,7 +414,19 @@ impl From<ScanFlightStatus> for ScanChangeStatus {
     }
 }
 
-fn rfc3339_from_ms(ms: i64) -> String {
+/// Instante del evento (ms Unix) para la ventana: `occurred_at`, acotado a
+/// `now_ms` si es futuro (reloj desfasado del productor). El validador de
+/// contrato solo revisa la forma del patrón, así que un `occurred_at` que no
+/// se pueda interpretar como fecha (por ejemplo, mes 13) usa la hora de
+/// recepción; no cuenta como registro malformado.
+fn event_instant_ms(event: &SecurityEvent, now_ms: i64) -> i64 {
+    OffsetDateTime::parse(event.occurred_at(), &Rfc3339)
+        .ok()
+        .and_then(|at| i64::try_from(at.unix_timestamp_nanos() / 1_000_000).ok())
+        .map_or(now_ms, |at_ms| at_ms.min(now_ms))
+}
+
+pub(crate) fn rfc3339_from_ms(ms: i64) -> String {
     OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000)
         .ok()
         .and_then(|at| at.format(&Rfc3339).ok())
@@ -475,6 +506,7 @@ impl AdminAggregator {
     /// visto (reentrega de Kinesis) se ignora.
     pub fn ingest(&self, event: &SecurityEvent) {
         let now_ms = self.clock.now_ms();
+        let at_ms = event_instant_ms(event, now_ms);
         let mut state = self.lock();
         if state.already_seen(event.event_id()) {
             return;
@@ -485,10 +517,10 @@ impl AdminAggregator {
         let scan_id = event.scan_id();
         match (event.event_type(), scan_id) {
             (EventType::ScanRequested, Some(id)) => {
-                scan_change = Some(state.track_scan(id, ScanFlightStatus::Requested, now_ms));
+                scan_change = Some(state.track_scan(id, ScanFlightStatus::Requested, at_ms));
             }
             (EventType::ScanStarted, Some(id)) => {
-                scan_change = Some(state.track_scan(id, ScanFlightStatus::Running, now_ms));
+                scan_change = Some(state.track_scan(id, ScanFlightStatus::Running, at_ms));
             }
             (
                 EventType::ScanCompleted | EventType::ScanFailed | EventType::ScanCancelled,
@@ -500,8 +532,8 @@ impl AdminAggregator {
                     status: ScanChangeStatus::Finished,
                 });
                 match event.event_type() {
-                    EventType::ScanCompleted => state.completed.add(now_ms),
-                    EventType::ScanFailed => state.failed.add(now_ms),
+                    EventType::ScanCompleted => state.completed.add(at_ms, now_ms),
+                    EventType::ScanFailed => state.failed.add(at_ms, now_ms),
                     _ => {}
                 }
             }
@@ -514,7 +546,7 @@ impl AdminAggregator {
             }
             (EventType::AuthLogin, _) => {
                 if let Some(actor) = event.actor_sub() {
-                    state.login(actor, now_ms);
+                    state.login(actor, at_ms, now_ms);
                 }
             }
             (EventType::AuthLogout, _) => {
@@ -522,7 +554,7 @@ impl AdminAggregator {
                     state.active_users.remove(actor);
                 }
             }
-            (EventType::RatelimitHit, _) => state.rate_limit_hits.add(now_ms),
+            (EventType::RatelimitHit, _) => state.rate_limit_hits.add(at_ms, now_ms),
             _ => {}
         }
 
@@ -649,8 +681,11 @@ mod tests {
     use super::*;
     use crate::security_event::SecurityEvent;
 
+    /// Instante inicial del reloj de los tests (y `occurred_at` por defecto).
+    const START_MS: i64 = 1_800_000_000_000;
+
     fn aggregator() -> (AdminAggregator, Arc<ManualClock>) {
-        let clock = Arc::new(ManualClock::new(1_800_000_000_000));
+        let clock = Arc::new(ManualClock::new(START_MS));
         (AdminAggregator::new(clock.clone()), clock)
     }
 
@@ -663,10 +698,29 @@ mod tests {
         scan: Option<&str>,
         payload: Value,
     ) -> SecurityEvent {
+        event_at(
+            n,
+            event_type,
+            actor,
+            scan,
+            payload,
+            &rfc3339_from_ms(START_MS),
+        )
+    }
+
+    /// Como [`event`], con `occurred_at` explícito.
+    fn event_at(
+        n: u64,
+        event_type: &str,
+        actor: Option<&str>,
+        scan: Option<&str>,
+        payload: Value,
+        occurred_at: &str,
+    ) -> SecurityEvent {
         let mut value = json!({
             "event_id": format!("00000000-0000-4000-8000-{n:012}"),
             "event_type": event_type,
-            "occurred_at": "2026-11-10T12:00:00Z",
+            "occurred_at": occurred_at,
             "source": "gateway",
             "payload": payload,
         });
@@ -739,6 +793,183 @@ mod tests {
             None,
             json!({"route": "/api/scans", "limit": 10, "window_seconds": 60}),
         )
+    }
+
+    /// `occurred_at` (RFC 3339) a `minutes` minutos de `START_MS` (negativo =
+    /// pasado).
+    fn minutes_from_start(minutes: i64) -> String {
+        rfc3339_from_ms(START_MS + minutes * 60_000)
+    }
+
+    fn failed_at(n: u64, scan: &str, at: &str) -> SecurityEvent {
+        event_at(
+            n,
+            "scan.failed",
+            None,
+            Some(scan),
+            json!({"reason_code": "ssh_timeout"}),
+            at,
+        )
+    }
+
+    #[test]
+    fn a_replayed_event_older_than_the_window_does_not_count_in_the_window_kpis() {
+        let (agg, _clock) = aggregator();
+        agg.ingest(&failed_at(1, "old", &minutes_from_start(-20)));
+        agg.ingest(&failed_at(2, "recent", &minutes_from_start(-5)));
+        agg.ingest(&event_at(
+            3,
+            "ratelimit.hit",
+            Some("u1"),
+            None,
+            json!({"route": "/api/scans", "limit": 10, "window_seconds": 60}),
+            &minutes_from_start(-20),
+        ));
+
+        let snap = agg.snapshot();
+        assert_eq!(snap.kpis.failed_last_window, 1, "solo el de hace 5 min");
+        assert_eq!(snap.kpis.rate_limit_hits, 0);
+        assert_eq!(
+            snap.recent_events.len(),
+            3,
+            "el registro reciente sí conserva lo reproducido"
+        );
+    }
+
+    #[test]
+    fn events_expire_from_the_window_by_their_occurred_at_not_by_arrival() {
+        let (agg, clock) = aggregator();
+        agg.ingest(&failed_at(1, "s1", &minutes_from_start(-10)));
+        assert_eq!(agg.snapshot().kpis.failed_last_window, 1);
+
+        clock.advance(Duration::from_secs(4 * 60));
+        assert_eq!(agg.snapshot().kpis.failed_last_window, 1, "hace 14 min");
+        clock.advance(Duration::from_secs(2 * 60));
+        assert_eq!(
+            agg.snapshot().kpis.failed_last_window,
+            0,
+            "hace 16 min: salió de la ventana aunque llegó hace 6"
+        );
+    }
+
+    #[test]
+    fn out_of_order_arrivals_land_in_their_own_second_bucket() {
+        let (agg, clock) = aggregator();
+        agg.ingest(&failed_at(1, "a", &minutes_from_start(-1)));
+        agg.ingest(&failed_at(2, "b", &minutes_from_start(-14)));
+        assert_eq!(agg.snapshot().kpis.failed_last_window, 2);
+
+        clock.advance(Duration::from_secs(2 * 60));
+        assert_eq!(
+            agg.snapshot().kpis.failed_last_window,
+            1,
+            "el de hace 14 min venció; el de hace 1 min sigue"
+        );
+    }
+
+    #[test]
+    fn a_future_occurred_at_clamps_to_now() {
+        let (agg, clock) = aggregator();
+        agg.ingest(&failed_at(1, "skewed", &minutes_from_start(60)));
+        assert_eq!(agg.snapshot().kpis.failed_last_window, 1);
+
+        clock.advance(Duration::from_secs(WINDOW_SECS));
+        assert_eq!(
+            agg.snapshot().kpis.failed_last_window,
+            0,
+            "vence 15 min después de llegar, no 15 min después de su fecha futura"
+        );
+    }
+
+    #[test]
+    fn a_shape_valid_but_unparseable_occurred_at_falls_back_to_arrival_time() {
+        let (agg, _clock) = aggregator();
+        // El validador de contrato solo revisa la forma del patrón.
+        agg.ingest(&failed_at(1, "bad", "2026-13-45T99:99:99Z"));
+
+        let snap = agg.snapshot();
+        assert_eq!(snap.kpis.failed_last_window, 1);
+        assert_eq!(
+            snap.kpis.malformed_records, 0,
+            "no es un registro malformado"
+        );
+    }
+
+    #[test]
+    fn a_replayed_request_and_completion_leave_no_phantom_scan_in_flight() {
+        let (agg, _clock) = aggregator();
+        agg.ingest(&event_at(
+            1,
+            "scan.requested",
+            Some("u1"),
+            Some("replayed"),
+            json!({"target": "198.51.100.4"}),
+            &minutes_from_start(-14),
+        ));
+        assert_eq!(agg.snapshot().kpis.scans_in_flight, 1);
+        agg.ingest(&event_at(
+            2,
+            "scan.completed",
+            None,
+            Some("replayed"),
+            json!({"duration_ms": 10, "finding_counts": {"critical":0,"high":0,"medium":0,"low":0,"info":0,"unknown":0}}),
+            &minutes_from_start(-13),
+        ));
+
+        let snap = agg.snapshot();
+        assert_eq!(snap.kpis.scans_in_flight, 0);
+        assert!(snap.scans_in_flight.is_empty());
+        assert_eq!(snap.kpis.completed_last_window, 1);
+    }
+
+    #[test]
+    fn a_replayed_request_older_than_an_hour_does_not_linger_in_flight() {
+        let (agg, _clock) = aggregator();
+        agg.ingest(&event_at(
+            1,
+            "scan.requested",
+            Some("u1"),
+            Some("ancient"),
+            json!({"target": "198.51.100.4"}),
+            &minutes_from_start(-90),
+        ));
+        assert_eq!(agg.snapshot().kpis.scans_in_flight, 0);
+    }
+
+    #[test]
+    fn a_replayed_login_older_than_the_window_does_not_make_an_active_user() {
+        let (agg, _clock) = aggregator();
+        agg.ingest(&event_at(
+            1,
+            "auth.login",
+            Some("old"),
+            None,
+            json!({}),
+            &minutes_from_start(-20),
+        ));
+        agg.ingest(&event_at(
+            2,
+            "auth.login",
+            Some("recent"),
+            None,
+            json!({}),
+            &minutes_from_start(-5),
+        ));
+        assert_eq!(agg.snapshot().kpis.active_users, 1);
+    }
+
+    #[test]
+    fn a_replayed_critical_finding_older_than_the_window_still_reaches_the_feed() {
+        let (agg, _clock) = aggregator();
+        agg.ingest(&event_at(
+            1,
+            "finding.critical",
+            None,
+            Some("s1"),
+            json!({"port": 22, "protocol": "tcp", "cve_id": "CVE-2023-38408", "severity": "critical", "confidence": "confirmed"}),
+            &minutes_from_start(-30),
+        ));
+        assert_eq!(agg.snapshot().critical_findings.len(), 1);
     }
 
     #[test]
@@ -836,7 +1067,14 @@ mod tests {
     fn in_flight_set_is_capped_and_evicts_the_oldest() {
         let (agg, clock) = aggregator();
         for i in 0..(MAX_IN_FLIGHT as u64 + 5) {
-            agg.ingest(&started(i, &format!("scan-{i}")));
+            agg.ingest(&event_at(
+                i,
+                "scan.started",
+                None,
+                Some(&format!("scan-{i}")),
+                json!({}),
+                &rfc3339_from_ms(clock.now_ms()),
+            ));
             clock.advance(Duration::from_millis(1));
         }
         let snap = agg.snapshot();

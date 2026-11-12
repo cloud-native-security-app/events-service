@@ -191,6 +191,7 @@ async fn events_published_to_kinesis_reach_the_metrics_endpoint() {
         tokio::time::sleep(Duration::from_millis(600)).await;
     }
 
+    let at = now_rfc3339();
     let nmap = |id: u64, event_type: &str, at: &str, payload: Value| {
         let mut body: Value =
             serde_json::from_slice(&event(id, event_type, at, None, Some("scan-e2e"), payload))
@@ -199,18 +200,11 @@ async fn events_published_to_kinesis_reach_the_metrics_endpoint() {
         serde_json::to_vec(&body).unwrap()
     };
     let mut bodies = vec![
-        event(
-            1,
-            "auth.login",
-            "2026-11-10T12:00:00Z",
-            Some("admin-1"),
-            None,
-            json!({}),
-        ),
+        event(1, "auth.login", &at, Some("admin-1"), None, json!({})),
         event(
             2,
             "scan.requested",
-            "2026-11-10T12:00:00Z",
+            &at,
             Some("admin-1"),
             Some("scan-e2e"),
             json!({"target": "198.51.100.4"}),
@@ -218,23 +212,23 @@ async fn events_published_to_kinesis_reach_the_metrics_endpoint() {
         event(
             3,
             "ratelimit.hit",
-            "2026-11-10T12:00:00Z",
+            &at,
             Some("admin-1"),
             None,
             json!({"route": "/api/scans", "limit": 10, "window_seconds": 60}),
         ),
-        nmap(0xa1, "scan.started", "2026-11-10T12:00:00Z", json!({})),
+        nmap(0xa1, "scan.started", &at, json!({})),
         nmap(
             0xa2,
             "finding.critical",
-            "2026-11-10T12:00:01Z",
+            &at,
             json!({"port": 22, "protocol": "tcp", "cve_id": "CVE-2023-38408",
                    "severity": "critical", "confidence": "confirmed"}),
         ),
         nmap(
             0xa3,
             "scan.completed",
-            "2026-11-10T12:00:02Z",
+            &at,
             json!({"duration_ms": 1200, "finding_counts":
                 {"critical": 1, "high": 0, "medium": 0, "low": 0, "info": 0, "unknown": 0}}),
         ),
