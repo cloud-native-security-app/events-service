@@ -31,6 +31,14 @@
 //!   usuarios activos con tope, hallazgos y registro con tope, y un conjunto
 //!   acotado de `event_id` recientes para ignorar reentregas (Kinesis entrega
 //!   al menos una vez).
+//! - **Serie por minuto**: el snapshot lleva `series` con 15 cubetas de un
+//!   minuto (UTC, la más antigua primero, la última es el minuto actual) con
+//!   conteos por `event_type` y, para `finding.critical`, por severidad
+//!   (`high`/`critical`; otra se ignora). Mismas reglas que la ventana: por
+//!   `occurred_at`, lo anterior a la ventana no se cuenta y lo futuro se acota
+//!   al minuto actual. Las cubetas vacías van con mapas vacíos. La ventana
+//!   rota con el reloj inyectado al ingerir y al tomar el snapshot (sin tarea
+//!   de fondo). Los deltas no cambian: el cliente suma 1 al minuto del evento.
 //! - **Deltas con valores absolutos**: cada [`AdminDelta`] lleva los KPIs
 //!   completos tras aplicar el evento, así que un delta perdido se corrige
 //!   solo con el siguiente. El `seq` creciente permite a un cliente detectar
@@ -39,7 +47,7 @@
 //!   `payload` (lo que el schema permite). `actor_sub` es un identificador
 //!   seudónimo; nunca hay correos, nombres ni tokens en un evento.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -221,6 +229,31 @@ pub struct AdminSnapshot {
     pub critical_findings: Vec<CriticalFinding>,
     /// Últimos eventos, el más reciente primero (máx. 100).
     pub recent_events: Vec<EventEntry>,
+    /// Serie por minuto de los últimos [`SERIES_BUCKETS`] minutos.
+    pub series: AdminSeries,
+}
+
+/// Serie temporal: exactamente [`SERIES_BUCKETS`] cubetas de un minuto, de la
+/// más antigua a la actual (UTC, `minute` = piso de `occurred_at` al minuto).
+/// Las cubetas vacías se incluyen con mapas vacíos (`{}`), nunca omitidas.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AdminSeries {
+    /// Ancho de cada cubeta, en segundos (siempre 60).
+    pub bucket_seconds: u64,
+    /// Cubetas, la más antigua primero; la última es el minuto actual.
+    pub buckets: Vec<SeriesBucket>,
+}
+
+/// Conteos de un minuto de la serie.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SeriesBucket {
+    /// Inicio del minuto (RFC 3339, UTC).
+    pub minute: String,
+    /// Eventos por `event_type` (todo tipo validado).
+    pub by_type: BTreeMap<String, u64>,
+    /// `finding.critical` por severidad del payload (`high` o `critical`;
+    /// cualquier otro valor se ignora aquí, aunque sí cuenta en `by_type`).
+    pub findings_by_severity: BTreeMap<String, u64>,
 }
 
 /// Cambio de un escaneo en curso.
@@ -247,6 +280,78 @@ pub struct AdminDelta {
     pub scan_change: Option<ScanChange>,
     /// Hallazgo crítico nuevo, si el evento era `finding.critical`.
     pub critical_finding: Option<CriticalFinding>,
+}
+
+/// Cubetas de la serie por minuto.
+pub const SERIES_BUCKETS: usize = 15;
+const SERIES_BUCKET_SECS: i64 = 60;
+
+#[derive(Debug, Default)]
+struct MinuteCounts {
+    by_type: BTreeMap<String, u64>,
+    findings_by_severity: BTreeMap<String, u64>,
+}
+
+/// Serie por minuto con memoria acotada: a lo sumo [`SERIES_BUCKETS`]
+/// minutos, cada uno con mapas pequeños (tipos de evento y severidades).
+#[derive(Debug, Default)]
+struct MinuteSeries {
+    /// Minuto (segundos epoch / 60) -> conteos.
+    buckets: BTreeMap<i64, MinuteCounts>,
+}
+
+impl MinuteSeries {
+    fn current_minute(now_ms: i64) -> i64 {
+        now_ms.div_euclid(1000).div_euclid(SERIES_BUCKET_SECS)
+    }
+
+    fn oldest_minute(now_ms: i64) -> i64 {
+        Self::current_minute(now_ms) - (SERIES_BUCKETS as i64 - 1)
+    }
+
+    fn prune(&mut self, now_ms: i64) {
+        let oldest = Self::oldest_minute(now_ms);
+        self.buckets = self.buckets.split_off(&oldest);
+    }
+
+    /// Cuenta un evento ocurrido en `at_ms` (ya acotado a `now_ms`); uno
+    /// anterior a la ventana no se cuenta.
+    fn add(&mut self, at_ms: i64, now_ms: i64, event_type: &str, severity: Option<&str>) {
+        self.prune(now_ms);
+        let minute = Self::current_minute(at_ms);
+        if minute < Self::oldest_minute(now_ms) {
+            return;
+        }
+        let counts = self.buckets.entry(minute).or_default();
+        *counts.by_type.entry(event_type.to_string()).or_default() += 1;
+        if let Some(severity @ ("high" | "critical")) = severity {
+            *counts
+                .findings_by_severity
+                .entry(severity.to_string())
+                .or_default() += 1;
+        }
+    }
+
+    fn snapshot(&mut self, now_ms: i64) -> AdminSeries {
+        self.prune(now_ms);
+        let oldest = Self::oldest_minute(now_ms);
+        let buckets = (oldest..oldest + SERIES_BUCKETS as i64)
+            .map(|minute| {
+                let counts = self.buckets.get(&minute);
+                SeriesBucket {
+                    minute: rfc3339_from_ms(minute * SERIES_BUCKET_SECS * 1000),
+                    by_type: counts.map(|c| c.by_type.clone()).unwrap_or_default(),
+                    findings_by_severity: counts
+                        .map(|c| c.findings_by_severity.clone())
+                        .unwrap_or_default(),
+                }
+            })
+            .collect();
+        AdminSeries {
+            bucket_seconds: SERIES_BUCKET_SECS as u64,
+            buckets,
+        }
+    }
 }
 
 /// Contador por cubetas de un segundo sobre la ventana deslizante: memoria
@@ -296,6 +401,7 @@ struct State {
     completed: WindowCounter,
     failed: WindowCounter,
     rate_limit_hits: WindowCounter,
+    series: MinuteSeries,
     in_flight: HashMap<String, InFlightEntry>,
     /// `actor_sub` -> instante (ms) del último login sin logout posterior.
     active_users: HashMap<String, i64>,
@@ -558,6 +664,14 @@ impl AdminAggregator {
             _ => {}
         }
 
+        let severity = match event.event_type() {
+            EventType::FindingCritical => event.payload().get("severity").and_then(Value::as_str),
+            _ => None,
+        };
+        state
+            .series
+            .add(at_ms, now_ms, event.event_type_str(), severity);
+
         let entry = event_entry(event);
         state.recent_events.push_front(entry.clone());
         state.recent_events.truncate(MAX_RECENT_EVENTS);
@@ -615,6 +729,7 @@ impl AdminAggregator {
                 .collect(),
             critical_findings: state.critical_findings.iter().cloned().collect(),
             recent_events: state.recent_events.iter().cloned().collect(),
+            series: state.series.snapshot(now_ms),
         }
     }
 
@@ -1319,5 +1434,160 @@ mod tests {
         }
         assert_eq!(value["window_seconds"], 900);
         assert_eq!(value["kpis"]["failure_rate"], Value::Null);
+    }
+
+    fn minute_iso(offset_minutes: i64) -> String {
+        rfc3339_from_ms(START_MS + offset_minutes * 60_000)
+    }
+
+    fn bucket_counts(snapshot: &AdminSnapshot) -> Vec<u64> {
+        snapshot
+            .series
+            .buckets
+            .iter()
+            .map(|b| b.by_type.values().sum())
+            .collect()
+    }
+
+    #[test]
+    fn an_empty_series_has_fifteen_empty_buckets_ending_at_the_current_minute() {
+        let (agg, _clock) = aggregator();
+        let series = agg.snapshot().series;
+        assert_eq!(series.bucket_seconds, 60);
+        assert_eq!(series.buckets.len(), 15);
+        assert_eq!(series.buckets[14].minute, minute_iso(0));
+        assert_eq!(series.buckets[0].minute, minute_iso(-14));
+        assert!(series
+            .buckets
+            .iter()
+            .all(|b| b.by_type.is_empty() && b.findings_by_severity.is_empty()));
+    }
+
+    #[test]
+    fn the_current_minute_is_the_floor_of_the_clock() {
+        let (agg, clock) = aggregator();
+        clock.advance(Duration::from_secs(59));
+        assert_eq!(agg.snapshot().series.buckets[14].minute, minute_iso(0));
+        clock.advance(Duration::from_secs(1));
+        assert_eq!(agg.snapshot().series.buckets[14].minute, minute_iso(1));
+    }
+
+    #[test]
+    fn events_land_in_the_minute_of_their_occurred_at_by_type() {
+        let (agg, _clock) = aggregator();
+        agg.ingest(&completed(1, "a"));
+        agg.ingest(&completed(2, "b"));
+        agg.ingest(&login(3, "u"));
+        agg.ingest(&event_at(
+            4,
+            "ratelimit.hit",
+            None,
+            None,
+            json!({"route": "/x", "client_key": "k", "limit": 1, "window_seconds": 60}),
+            &minute_iso(-3),
+        ));
+        let series = agg.snapshot().series;
+        assert_eq!(series.buckets[14].by_type["scan.completed"], 2);
+        assert_eq!(series.buckets[14].by_type["auth.login"], 1);
+        assert_eq!(series.buckets[11].by_type["ratelimit.hit"], 1);
+        assert_eq!(bucket_counts(&agg.snapshot()).iter().sum::<u64>(), 4);
+    }
+
+    #[test]
+    fn the_window_rotates_when_the_clock_advances_and_old_minutes_drop() {
+        let (agg, clock) = aggregator();
+        agg.ingest(&completed(1, "a"));
+        clock.advance(Duration::from_secs(120));
+        let series = agg.snapshot().series;
+        assert_eq!(series.buckets[14].minute, minute_iso(2));
+        assert_eq!(series.buckets[12].by_type["scan.completed"], 1);
+        clock.advance(Duration::from_secs(13 * 60));
+        let series = agg.snapshot().series;
+        assert_eq!(series.buckets[0].minute, minute_iso(1));
+        assert!(series.buckets.iter().all(|b| b.by_type.is_empty()));
+    }
+
+    #[test]
+    fn an_event_older_than_the_window_is_not_bucketed() {
+        let (agg, _clock) = aggregator();
+        agg.ingest(&event_at(
+            1,
+            "auth.login",
+            Some("u"),
+            None,
+            json!({}),
+            &minute_iso(-15),
+        ));
+        agg.ingest(&event_at(
+            2,
+            "auth.login",
+            Some("v"),
+            None,
+            json!({}),
+            &minute_iso(-14),
+        ));
+        let series = agg.snapshot().series;
+        assert_eq!(series.buckets[0].by_type["auth.login"], 1);
+        assert_eq!(bucket_counts(&agg.snapshot()).iter().sum::<u64>(), 1);
+    }
+
+    #[test]
+    fn a_future_occurred_at_clamps_to_the_current_minute_in_the_series() {
+        let (agg, _clock) = aggregator();
+        agg.ingest(&event_at(
+            1,
+            "auth.login",
+            Some("u"),
+            None,
+            json!({}),
+            &minute_iso(5),
+        ));
+        assert_eq!(agg.snapshot().series.buckets[14].by_type["auth.login"], 1);
+    }
+
+    #[test]
+    fn critical_findings_count_by_severity_and_unknown_severities_are_ignored() {
+        let (agg, _clock) = aggregator();
+        agg.ingest(&critical(1, "a"));
+        agg.ingest(&event(2, "finding.critical", None, Some("a"), json!({"port": 22, "protocol": "tcp", "cve_id": null, "severity": "high", "confidence": "confirmed"})));
+        agg.ingest(&event(3, "finding.critical", None, Some("a"), json!({"port": 22, "protocol": "tcp", "cve_id": null, "severity": "weird", "confidence": "confirmed"})));
+        let bucket = &agg.snapshot().series.buckets[14];
+        assert_eq!(bucket.by_type["finding.critical"], 3);
+        assert_eq!(bucket.findings_by_severity["critical"], 1);
+        assert_eq!(bucket.findings_by_severity["high"], 1);
+        assert_eq!(bucket.findings_by_severity.len(), 2);
+    }
+
+    #[test]
+    fn series_memory_is_bounded_to_the_window() {
+        let (agg, clock) = aggregator();
+        for i in 0..40u64 {
+            agg.ingest(&login(i, "u"));
+            clock.advance(Duration::from_secs(60));
+        }
+        assert_eq!(agg.snapshot().series.buckets.len(), 15);
+        assert!(agg.lock().series.buckets.len() <= 15);
+    }
+
+    #[test]
+    fn the_series_serializes_with_the_documented_shape() {
+        let (agg, _clock) = aggregator();
+        agg.ingest(&critical(1, "a"));
+        let value = serde_json::to_value(agg.snapshot()).unwrap();
+        assert_eq!(value["series"]["bucket_seconds"], 60);
+        let buckets = value["series"]["buckets"].as_array().unwrap();
+        assert_eq!(buckets.len(), 15);
+        assert_eq!(
+            buckets[14],
+            json!({
+                "minute": minute_iso(0),
+                "by_type": {"finding.critical": 1},
+                "findings_by_severity": {"critical": 1}
+            })
+        );
+        assert_eq!(
+            buckets[0],
+            json!({"minute": minute_iso(-14), "by_type": {}, "findings_by_severity": {}})
+        );
     }
 }

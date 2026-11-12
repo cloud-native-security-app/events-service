@@ -34,7 +34,14 @@ READMEs are in Spanish.
 - Every other route requires `X-Gateway-Secret` (constant-time compare);
   otherwise `401`.
 - `GET /metrics`: JSON snapshot (`seq`, `kpis`, `scans_in_flight`,
-  `critical_findings`, `recent_events`).
+  `critical_findings`, `recent_events`, `series`). `series` is
+  `{"bucket_seconds": 60, "buckets": [{"minute": "<RFC 3339 UTC>", "by_type":
+  {"scan.completed": 3}, "findings_by_severity": {"high": 2, "critical": 1}}]}`:
+  exactly 15 buckets, oldest first, the last one is the current minute. Empty
+  buckets are present with `{}` maps. Buckets use `occurred_at` (older than the
+  window is dropped, future clamps to the current minute); severities other
+  than `high`/`critical` are ignored. Deltas are unchanged: clients add +1 to
+  the bucket of the delta event's `occurred_at` minute and rotate each minute.
 - `GET /events`: `text/event-stream`. First a `snapshot` event, then one
   `delta` event per new event or malformed record, a fresh `snapshot` after a
   client lag and every 60 s, and `: ping` comments every 15 s. The stream ends
