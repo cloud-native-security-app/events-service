@@ -7,6 +7,7 @@
 #![deny(missing_docs)]
 
 pub mod admin;
+pub mod admin_routes;
 pub mod auth;
 pub mod config;
 pub mod event_contract;
@@ -23,7 +24,12 @@ pub mod wiring;
 /// server cannot bind or keeps failing.
 pub async fn run() -> Result<(), RunError> {
     let config = config::Config::from_env()?;
-    let app = wiring::build_router(&config);
+    let feed = std::sync::Arc::new(admin::AdminFeed::default());
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    if let Some(consumer) = wiring::build_consumer(&config, &feed).await {
+        tokio::spawn(consumer.run(shutdown.clone()));
+    }
+    let app = wiring::build_router(&config, feed, shutdown);
 
     let listener = tokio::net::TcpListener::bind((config.http_host.as_str(), config.http_port))
         .await
