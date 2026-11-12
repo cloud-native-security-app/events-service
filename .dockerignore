@@ -1,0 +1,8 @@
+# Minimal build context: only what `cargo build --release --bin events_service` needs.
+target/
+.git/
+.github/
+.gitignore
+*.md
+Dockerfile
+.dockerignore
