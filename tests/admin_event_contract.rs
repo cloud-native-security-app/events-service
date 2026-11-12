@@ -68,7 +68,21 @@ fn examples() -> Option<Vec<(String, Value)>> {
 #[test]
 fn every_broker_example_is_accepted_by_the_consumer_and_updates_the_aggregator() {
     let Some(examples) = examples() else { return };
-    let aggregator = AdminAggregator::new(Arc::new(ManualClock::new(1_800_000_000_000)));
+    // The window is keyed by `occurred_at`: the clock stands at the latest
+    // example, so every example falls inside the 15-minute window.
+    let latest_ms = examples
+        .iter()
+        .map(|(_, example)| {
+            let at = time::OffsetDateTime::parse(
+                example["occurred_at"].as_str().unwrap(),
+                &time::format_description::well_known::Rfc3339,
+            )
+            .unwrap();
+            (at.unix_timestamp_nanos() / 1_000_000) as i64
+        })
+        .max()
+        .unwrap();
+    let aggregator = AdminAggregator::new(Arc::new(ManualClock::new(latest_ms)));
     for (name, example) in &examples {
         let bytes = serde_json::to_vec(example).unwrap();
         let event = parse_record(&bytes)

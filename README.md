@@ -10,8 +10,8 @@ balancer) and rejects every request except `/health` unless it carries the
 shared secret.
 
 > Status: the consumer, aggregator, event contract validator and admin routes
-> moved here from the gateway with the same behavior and payloads. Warm start,
-> time series and OpenAPI come later (AP-04, AP-05).
+> moved here from the gateway with the same behavior and payloads. Time series
+> and OpenAPI come later (AP-05).
 
 Language: this README and the code comments are in English; the other service
 READMEs are in Spanish.
@@ -42,6 +42,23 @@ READMEs are in Spanish.
 
 The admin identity is not checked here: authorization (session, admin role and
 its periodic re-check) stays in the gateway.
+
+## Behavior after a restart
+
+The consumer reads the stream directly (no KCL, no checkpoint store). The first
+iterator of each shard worker is `AT_TIMESTAMP` at `now - 15 min`, so a
+restarted instance replays the last window and the panel is not empty. The
+`event_id` dedupe absorbs any overlap. If an iterator expires while running,
+the worker resumes from `LATEST` (the gap is lost, a `warn` is logged). A shard
+created by a resharding also starts with the 15-minute replay.
+
+The 15-minute window is keyed by each event's `occurred_at`, not by arrival
+time. The window KPIs (completed, failed, rate-limit hits, active users) count
+only events whose `occurred_at` falls inside the window; older replayed events
+still feed `recent_events`, the critical findings and the scans in flight (a
+replayed `scan.requested` followed by its `scan.completed` leaves nothing in
+flight). A future `occurred_at` (clock skew) clamps to now; one that cannot be
+parsed as a date falls back to arrival time (it is not counted as malformed).
 
 ## Shutdown
 
