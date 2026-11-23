@@ -46,9 +46,12 @@
 //!   ni a la serie, ni genera delta) y los campos SIEM van vacíos o en cero.
 //!   Encendido: KPI `siem_alerts` (total y por severidad) con las reglas de la
 //!   ventana, feed `siem_alerts` (más reciente primero, máx.
-//!   [`MAX_SIEM_ALERTS`] = 10, acotado por tamaño: el gateway corta el stream
-//!   si un frame SSE pasa de 64 KiB y 10 alertas de peor caso (campos de texto
-//!   al máximo, 4 bytes por carácter) ocupan unos 30 KB; incluye lo reproducido como los hallazgos críticos;
+//!   [`MAX_SIEM_ALERTS`] = 8, acotado por tamaño: el gateway corta el stream
+//!   si un frame SSE pasa de 64 KiB y 8 alertas de peor caso (campos de texto
+//!   al máximo, 6 bytes por carácter con escapes) dejan el snapshot solo con
+//!   SIEM en unos 36 KB, bajo el presupuesto de 40 KiB. Un `siem.alert` no
+//!   entra al registro reciente ni a su delta (`event` es `null`): viaja solo
+//!   por el feed y `siem_alert`. Incluye lo reproducido como los hallazgos críticos;
 //!   trae las cuatro severidades para que el cliente filtre) y, por cubeta de
 //!   la serie, `siem_alerts_by_severity`. Un payload inutilizable (que el
 //!   validador de contrato ya rechaza antes) se omite sin tocar nada.
@@ -78,7 +81,7 @@ pub const WINDOW_SECS: u64 = 900;
 /// Máximo de hallazgos críticos retenidos.
 pub const MAX_CRITICAL_FINDINGS: usize = 50;
 /// Máximo de alertas SIEM retenidas en el feed.
-pub const MAX_SIEM_ALERTS: usize = 10;
+pub const MAX_SIEM_ALERTS: usize = 8;
 /// Máximo de eventos en el registro reciente.
 pub const MAX_RECENT_EVENTS: usize = 100;
 /// Máximo de escaneos en curso rastreados.
@@ -836,14 +839,19 @@ impl AdminAggregator {
             .series
             .add(at_ms, now_ms, event.event_type_str(), severities);
 
-        let entry = event_entry(event);
-        state.recent_events.push_front(entry.clone());
-        state.recent_events.truncate(MAX_RECENT_EVENTS);
+        // Un `siem.alert` viaja por su feed y su delta propios: llevarlo
+        // también al registro duplicaría hasta 3 KB por entrada en el frame.
+        let entry = (event.event_type() != EventType::SiemAlert).then(|| {
+            let entry = event_entry(event);
+            state.recent_events.push_front(entry.clone());
+            state.recent_events.truncate(MAX_RECENT_EVENTS);
+            entry
+        });
 
         state.seq += 1;
         let delta = AdminDelta {
             seq: state.seq,
-            event: Some(entry),
+            event: entry,
             kpis: state.kpis(now_ms),
             scan_change,
             critical_finding: critical,
@@ -2043,5 +2051,36 @@ mod tests {
             siem_only + SSE_FRAME_OVERHEAD <= SIEM_FRAME_BUDGET,
             "el feed SIEM mide {siem_only} bytes, presupuesto {SIEM_FRAME_BUDGET}"
         );
+    }
+
+    #[test]
+    fn siem_alerts_stay_out_of_the_recent_events_log_and_the_siem_snapshot_fits_the_budget() {
+        // `\u{1}` se escapa como 6 bytes en JSON: el peor caso de tamaño.
+        let (agg, _clock) = siem_aggregator();
+        for n in 0..(MAX_SIEM_ALERTS as u64 + 5) {
+            agg.ingest(&siem_event_with(
+                n,
+                worst_case_siem_payload("\u{1}"),
+                &rfc3339_from_ms(START_MS),
+            ));
+        }
+        let snapshot = agg.snapshot();
+        assert_eq!(snapshot.siem_alerts.len(), MAX_SIEM_ALERTS);
+        assert!(snapshot.recent_events.is_empty());
+        let whole = serde_json::to_string(&snapshot).unwrap().len() + SSE_FRAME_OVERHEAD;
+        assert!(
+            whole <= SIEM_FRAME_BUDGET,
+            "el snapshot solo con SIEM mide {whole} bytes, presupuesto {SIEM_FRAME_BUDGET}"
+        );
+    }
+
+    #[test]
+    fn the_siem_delta_carries_the_alert_but_not_a_recent_events_entry() {
+        let (agg, _clock) = siem_aggregator();
+        let (_, mut rx) = agg.subscribe_with_snapshot();
+        agg.ingest(&siem(1, 12));
+        let delta = rx.try_recv().unwrap();
+        assert!(delta.siem_alert.is_some());
+        assert!(delta.event.is_none());
     }
 }

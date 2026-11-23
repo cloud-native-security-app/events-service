@@ -93,8 +93,8 @@ fn every_broker_example_is_accepted_by_the_consumer_and_updates_the_aggregator()
     let snapshot = aggregator.snapshot();
     assert_eq!(
         snapshot.recent_events.len(),
-        15,
-        "un evento de registro por ejemplo"
+        13,
+        "un evento de registro por ejemplo, salvo los dos siem.alert (van a su feed)"
     );
     assert_eq!(snapshot.critical_findings.len(), 1);
     assert_eq!(snapshot.siem_alerts.len(), 2);
