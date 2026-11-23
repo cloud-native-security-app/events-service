@@ -46,7 +46,9 @@
 //!   ni a la serie, ni genera delta) y los campos SIEM van vacíos o en cero.
 //!   Encendido: KPI `siem_alerts` (total y por severidad) con las reglas de la
 //!   ventana, feed `siem_alerts` (más reciente primero, máx.
-//!   [`MAX_SIEM_ALERTS`], incluye lo reproducido como los hallazgos críticos;
+//!   [`MAX_SIEM_ALERTS`] = 10, acotado por tamaño: el gateway corta el stream
+//!   si un frame SSE pasa de 64 KiB y 10 alertas de peor caso (campos de texto
+//!   al máximo, 4 bytes por carácter) ocupan unos 30 KB; incluye lo reproducido como los hallazgos críticos;
 //!   trae las cuatro severidades para que el cliente filtre) y, por cubeta de
 //!   la serie, `siem_alerts_by_severity`. Un payload inutilizable (que el
 //!   validador de contrato ya rechaza antes) se omite sin tocar nada.
@@ -76,7 +78,7 @@ pub const WINDOW_SECS: u64 = 900;
 /// Máximo de hallazgos críticos retenidos.
 pub const MAX_CRITICAL_FINDINGS: usize = 50;
 /// Máximo de alertas SIEM retenidas en el feed.
-pub const MAX_SIEM_ALERTS: usize = 100;
+pub const MAX_SIEM_ALERTS: usize = 10;
 /// Máximo de eventos en el registro reciente.
 pub const MAX_RECENT_EVENTS: usize = 100;
 /// Máximo de escaneos en curso rastreados.
@@ -1999,6 +2001,47 @@ mod tests {
         assert_eq!(
             value["kpis"]["siem_alerts_by_severity"],
             json!({"low": 0, "medium": 1, "high": 0, "critical": 0})
+        );
+    }
+
+    /// Presupuesto del feed SIEM dentro del frame SSE del snapshot: el gateway
+    /// corta el stream si un frame pasa de 64 KiB
+    /// (`gateway/src/events_client.rs`), y el snapshot lleva más feeds.
+    const SIEM_FRAME_BUDGET: usize = 40 * 1024;
+    /// Sobrecarga del frame SSE (`event: snapshot\ndata: ...\n\n`).
+    const SSE_FRAME_OVERHEAD: usize = 32;
+
+    fn worst_case_siem_payload(text: &str) -> Value {
+        let ipv6 = "2001:0db8:85a3:0000:0000:8a2e:0370:7334";
+        json!({
+            "rule_id": "r".repeat(64),
+            "rule_level": 15,
+            "severity": "critical",
+            "description": text.repeat(256),
+            "agent": {"id": "a".repeat(64), "name": text.repeat(128)},
+            "src_ip": ipv6,
+            "dest_ip": ipv6,
+            "signature": text.repeat(256)
+        })
+    }
+
+    #[test]
+    fn a_full_siem_feed_of_worst_case_alerts_fits_the_siem_frame_budget() {
+        // Cuatro bytes por carácter: el peor caso multibyte de UTF-8.
+        let (agg, _clock) = siem_aggregator();
+        for n in 0..(MAX_SIEM_ALERTS as u64 + 1) {
+            agg.ingest(&siem_event_with(
+                n,
+                worst_case_siem_payload("\u{1F6A8}"),
+                &rfc3339_from_ms(START_MS),
+            ));
+        }
+        let snapshot = agg.snapshot();
+        assert_eq!(snapshot.siem_alerts.len(), MAX_SIEM_ALERTS);
+        let siem_only = serde_json::to_string(&snapshot.siem_alerts).unwrap().len();
+        assert!(
+            siem_only + SSE_FRAME_OVERHEAD <= SIEM_FRAME_BUDGET,
+            "el feed SIEM mide {siem_only} bytes, presupuesto {SIEM_FRAME_BUDGET}"
         );
     }
 }

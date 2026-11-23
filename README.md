@@ -48,7 +48,8 @@ READMEs are in Spanish.
   the bucket of the delta event's `occurred_at` minute and rotate each minute.
 - SIEM additions to the snapshot (additive; existing fields unchanged):
   `siem_enabled` (bool, always present), `siem_alerts` (newest first, at most
-  100, every severity so the client can filter; each `{event_id, occurred_at,
+  10 (bounded by bytes: the gateway cuts the stream on a frame over 64 KiB and
+  ten worst-case alerts are about 30 KB), every severity so the client can filter; each `{event_id, occurred_at,
   severity, rule_id, rule_level, description, agent: {id, name}, src_ip,
   dest_ip, signature}` with `null` for the absent optionals), `kpis.siem_alerts`
   (count in the window) and `kpis.siem_alerts_by_severity` (`{low, medium,
@@ -58,7 +59,7 @@ READMEs are in Spanish.
   off the feed is `[]`, the KPIs are 0, and an arriving `siem.alert` is ignored
   entirely (not in `recent_events`, not in the series, no delta). Window rules
   are the same as the other KPIs (`occurred_at`; a replayed alert older than
-  the window reaches the feed but not the KPI). The 100-entry feed is shared by
+  the window reaches the feed but not the KPI). The 10-entry feed is shared by
   all severities, so a burst of low alerts can push older high ones out.
 - `GET /events`: `text/event-stream`. First a `snapshot` event, then one
   `delta` event per new event or malformed record, a fresh `snapshot` after a
