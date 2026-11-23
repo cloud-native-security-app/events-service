@@ -9,6 +9,9 @@ Internal only: it sits behind the gateway (Service Connect, no public load
 balancer) and rejects every request except `/health` unless it carries the
 shared secret.
 
+> Status (SIEM): `siem.alert` events (Wazuh alerts relayed by the gateway) are
+> aggregated when `SIEM_ENABLED=true`; see below.
+>
 > Status: the consumer, aggregator, event contract validator and admin routes
 > moved here from the gateway with the same behavior and payloads. Time series
 > and OpenAPI come later (AP-05).
@@ -24,6 +27,7 @@ READMEs are in Spanish.
 | `HTTP_PORT` | yes | TCP port to bind, for example `8080`. |
 | `GATEWAY_SHARED_SECRET` | yes | Secret the gateway sends in the `X-Gateway-Secret` header. Blank counts as missing. Never logged. |
 | `SECURITY_EVENTS_STREAM_NAME` | no | Kinesis stream to read. When unset the consumer does not start, a warning is logged and the admin routes serve an empty aggregator. |
+| `SIEM_ENABLED` | no | `true`/`1` turns on the `siem.alert` aggregation; default `false` (blank counts as unset, any other value fails startup). Off, `siem.alert` events are ignored and the snapshot says `siem_enabled: false`. |
 | `AWS_REGION` | no | AWS region of the stream, default `us-east-1`. |
 | `AWS_ENDPOINT_URL` | no | Endpoint override, only for LocalStack. |
 | `RUST_LOG` | no | `tracing` filter, default `info`. |
@@ -42,6 +46,22 @@ READMEs are in Spanish.
   window is dropped, future clamps to the current minute); severities other
   than `high`/`critical` are ignored. Deltas are unchanged: clients add +1 to
   the bucket of the delta event's `occurred_at` minute and rotate each minute.
+- SIEM additions to the snapshot (additive; existing fields unchanged):
+  `siem_enabled` (bool, always present), `siem_alerts` (newest first, at most
+  8 (bounded by bytes: the gateway cuts the stream on a frame over 64 KiB and
+  eight worst-case alerts, with 6-byte JSON escapes, leave a SIEM-only snapshot
+  at about 36 KB), every severity so the client can filter; each `{event_id, occurred_at,
+  severity, rule_id, rule_level, description, agent: {id, name}, src_ip,
+  dest_ip, signature}` with `null` for the absent optionals), `kpis.siem_alerts`
+  (count in the window) and `kpis.siem_alerts_by_severity` (`{low, medium,
+  high, critical}`, always four keys), and `siem_alerts_by_severity` in each
+  series bucket (only severities with alerts, `{}` otherwise). Deltas carry
+  `siem_alert` (the new alert or `null`) and the updated `kpis`. With the SIEM
+  off the feed is `[]`, the KPIs are 0, and an arriving `siem.alert` is ignored
+  entirely (not in `recent_events`, not in the series, no delta). With it on, a `siem.alert` is also kept out of `recent_events`, and its delta has `event: null`: the alert travels only in `siem_alerts` and `siem_alert`. Window rules
+  are the same as the other KPIs (`occurred_at`; a replayed alert older than
+  the window reaches the feed but not the KPI). The 8-entry feed is shared by
+  all severities, so a burst of low alerts can push older high ones out.
 - `GET /events`: `text/event-stream`. First a `snapshot` event, then one
   `delta` event per new event or malformed record, a fresh `snapshot` after a
   client lag and every 60 s, and `: ping` comments every 15 s. The stream ends

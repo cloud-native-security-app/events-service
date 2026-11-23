@@ -39,6 +39,22 @@
 //!   al minuto actual. Las cubetas vacías van con mapas vacíos. La ventana
 //!   rota con el reloj inyectado al ingerir y al tomar el snapshot (sin tarea
 //!   de fondo). Los deltas no cambian: el cliente suma 1 al minuto del evento.
+//! - **SIEM (`siem.alert`)**: se agrega solo si el servicio arranca con
+//!   `SIEM_ENABLED=true` ([`AdminAggregator::with_siem_enabled`]); el snapshot
+//!   lleva `siem_enabled` para que el front muestre la pestaña solo entonces.
+//!   Apagado, un `siem.alert` se ignora por completo (no entra al registro,
+//!   ni a la serie, ni genera delta) y los campos SIEM van vacíos o en cero.
+//!   Encendido: KPI `siem_alerts` (total y por severidad) con las reglas de la
+//!   ventana, feed `siem_alerts` (más reciente primero, máx.
+//!   [`MAX_SIEM_ALERTS`] = 8, acotado por tamaño: el gateway corta el stream
+//!   si un frame SSE pasa de 64 KiB y 8 alertas de peor caso (campos de texto
+//!   al máximo, 6 bytes por carácter con escapes) dejan el snapshot solo con
+//!   SIEM en unos 36 KB, bajo el presupuesto de 40 KiB. Un `siem.alert` no
+//!   entra al registro reciente ni a su delta (`event` es `null`): viaja solo
+//!   por el feed y `siem_alert`. Incluye lo reproducido como los hallazgos críticos;
+//!   trae las cuatro severidades para que el cliente filtre) y, por cubeta de
+//!   la serie, `siem_alerts_by_severity`. Un payload inutilizable (que el
+//!   validador de contrato ya rechaza antes) se omite sin tocar nada.
 //! - **Deltas con valores absolutos**: cada [`AdminDelta`] lleva los KPIs
 //!   completos tras aplicar el evento, así que un delta perdido se corrige
 //!   solo con el siguiente. El `seq` creciente permite a un cliente detectar
@@ -64,6 +80,8 @@ use crate::security_event::{EventType, SecurityEvent};
 pub const WINDOW_SECS: u64 = 900;
 /// Máximo de hallazgos críticos retenidos.
 pub const MAX_CRITICAL_FINDINGS: usize = 50;
+/// Máximo de alertas SIEM retenidas en el feed.
+pub const MAX_SIEM_ALERTS: usize = 8;
 /// Máximo de eventos en el registro reciente.
 pub const MAX_RECENT_EVENTS: usize = 100;
 /// Máximo de escaneos en curso rastreados.
@@ -171,6 +189,55 @@ pub struct CriticalFinding {
     pub confidence: String,
 }
 
+/// Agente Wazuh que originó una alerta.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SiemAgent {
+    /// `agent.id` de Wazuh.
+    pub id: String,
+    /// `agent.name` de Wazuh.
+    pub name: String,
+}
+
+/// Alerta SIEM (`siem.alert`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SiemAlert {
+    /// `event_id` del evento (identificador estable para el cliente).
+    pub event_id: String,
+    /// Instante del evento según el productor.
+    pub occurred_at: String,
+    /// `low`, `medium`, `high` o `critical`.
+    pub severity: String,
+    /// `rule.id` de Wazuh.
+    pub rule_id: String,
+    /// `rule.level` de Wazuh (0..15).
+    pub rule_level: u8,
+    /// Descripción de la regla (máx. 256).
+    pub description: String,
+    /// Agente que la reportó.
+    pub agent: SiemAgent,
+    /// IP de origen, si la hay.
+    pub src_ip: Option<String>,
+    /// IP de destino, si la hay.
+    pub dest_ip: Option<String>,
+    /// Firma de Suricata, si la alerta viene de Suricata.
+    pub signature: Option<String>,
+}
+
+/// Alertas SIEM por severidad (las cuatro claves siempre presentes).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct SiemSeverityCounts {
+    /// Severidad `low`.
+    pub low: u64,
+    /// Severidad `medium`.
+    pub medium: u64,
+    /// Severidad `high`.
+    pub high: u64,
+    /// Severidad `critical`.
+    pub critical: u64,
+}
+
+const SIEM_SEVERITIES: [&str; 4] = ["low", "medium", "high", "critical"];
+
 /// Entrada del registro de eventos: campos del sobre más el `payload`, nada más.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EventEntry {
@@ -209,6 +276,10 @@ pub struct Kpis {
     pub rate_limit_hits: u64,
     /// Registros descartados por malformados desde que arrancó el proceso.
     pub malformed_records: u64,
+    /// `siem.alert` en la ventana (0 con el SIEM apagado).
+    pub siem_alerts: u64,
+    /// `siem.alert` en la ventana por severidad.
+    pub siem_alerts_by_severity: SiemSeverityCounts,
 }
 
 /// Vista completa del estado, que sirve `GET /api/admin/metrics` y el primer
@@ -231,6 +302,12 @@ pub struct AdminSnapshot {
     pub recent_events: Vec<EventEntry>,
     /// Serie por minuto de los últimos [`SERIES_BUCKETS`] minutos.
     pub series: AdminSeries,
+    /// Si el SIEM está habilitado (`SIEM_ENABLED`); el front muestra la
+    /// pestaña de alertas solo entonces.
+    pub siem_enabled: bool,
+    /// Alertas SIEM, la más reciente primero (máx. 100); vacío con el SIEM
+    /// apagado.
+    pub siem_alerts: Vec<SiemAlert>,
 }
 
 /// Serie temporal: exactamente [`SERIES_BUCKETS`] cubetas de un minuto, de la
@@ -254,6 +331,9 @@ pub struct SeriesBucket {
     /// `finding.critical` por severidad del payload (`high` o `critical`;
     /// cualquier otro valor se ignora aquí, aunque sí cuenta en `by_type`).
     pub findings_by_severity: BTreeMap<String, u64>,
+    /// `siem.alert` por severidad (`low`, `medium`, `high`, `critical`);
+    /// solo las severidades con alertas.
+    pub siem_alerts_by_severity: BTreeMap<String, u64>,
 }
 
 /// Cambio de un escaneo en curso.
@@ -280,16 +360,26 @@ pub struct AdminDelta {
     pub scan_change: Option<ScanChange>,
     /// Hallazgo crítico nuevo, si el evento era `finding.critical`.
     pub critical_finding: Option<CriticalFinding>,
+    /// Alerta SIEM nueva, si el evento era `siem.alert`.
+    pub siem_alert: Option<SiemAlert>,
 }
 
 /// Cubetas de la serie por minuto.
 pub const SERIES_BUCKETS: usize = 15;
 const SERIES_BUCKET_SECS: i64 = 60;
 
+/// Severidades del payload que la serie cuenta aparte del `event_type`.
+#[derive(Debug, Clone, Copy, Default)]
+struct Severities<'a> {
+    finding: Option<&'a str>,
+    siem: Option<&'a str>,
+}
+
 #[derive(Debug, Default)]
 struct MinuteCounts {
     by_type: BTreeMap<String, u64>,
     findings_by_severity: BTreeMap<String, u64>,
+    siem_by_severity: BTreeMap<String, u64>,
 }
 
 /// Serie por minuto con memoria acotada: a lo sumo [`SERIES_BUCKETS`]
@@ -316,7 +406,7 @@ impl MinuteSeries {
 
     /// Cuenta un evento ocurrido en `at_ms` (ya acotado a `now_ms`); uno
     /// anterior a la ventana no se cuenta.
-    fn add(&mut self, at_ms: i64, now_ms: i64, event_type: &str, severity: Option<&str>) {
+    fn add(&mut self, at_ms: i64, now_ms: i64, event_type: &str, severities: Severities<'_>) {
         self.prune(now_ms);
         let minute = Self::current_minute(at_ms);
         if minute < Self::oldest_minute(now_ms) {
@@ -324,9 +414,15 @@ impl MinuteSeries {
         }
         let counts = self.buckets.entry(minute).or_default();
         *counts.by_type.entry(event_type.to_string()).or_default() += 1;
-        if let Some(severity @ ("high" | "critical")) = severity {
+        if let Some(severity @ ("high" | "critical")) = severities.finding {
             *counts
                 .findings_by_severity
+                .entry(severity.to_string())
+                .or_default() += 1;
+        }
+        if let Some(severity) = severities.siem {
+            *counts
+                .siem_by_severity
                 .entry(severity.to_string())
                 .or_default() += 1;
         }
@@ -343,6 +439,9 @@ impl MinuteSeries {
                     by_type: counts.map(|c| c.by_type.clone()).unwrap_or_default(),
                     findings_by_severity: counts
                         .map(|c| c.findings_by_severity.clone())
+                        .unwrap_or_default(),
+                    siem_alerts_by_severity: counts
+                        .map(|c| c.siem_by_severity.clone())
                         .unwrap_or_default(),
                 }
             })
@@ -401,15 +500,22 @@ struct State {
     completed: WindowCounter,
     failed: WindowCounter,
     rate_limit_hits: WindowCounter,
+    /// Alertas SIEM de la ventana, en el orden de [`SIEM_SEVERITIES`].
+    siem: [WindowCounter; 4],
     series: MinuteSeries,
     in_flight: HashMap<String, InFlightEntry>,
     /// `actor_sub` -> instante (ms) del último login sin logout posterior.
     active_users: HashMap<String, i64>,
     critical_findings: VecDeque<CriticalFinding>,
+    siem_alerts: VecDeque<SiemAlert>,
     recent_events: VecDeque<EventEntry>,
     malformed_records: u64,
     seen_ids: HashSet<String>,
     seen_order: VecDeque<String>,
+}
+
+fn each_mut<T, const N: usize>(items: &mut [T; N]) -> [&mut T; N] {
+    items.each_mut()
 }
 
 fn window_ms() -> i64 {
@@ -430,6 +536,7 @@ impl State {
         let completed = self.completed.count(now_ms);
         let failed = self.failed.count(now_ms);
         let finished = completed + failed;
+        let [low, medium, high, critical] = each_mut(&mut self.siem).map(|c| c.count(now_ms));
         Kpis {
             scans_in_flight: self.in_flight.len() as u64,
             completed_last_window: completed,
@@ -438,6 +545,13 @@ impl State {
             active_users: self.active_users.len() as u64,
             rate_limit_hits: self.rate_limit_hits.count(now_ms),
             malformed_records: self.malformed_records,
+            siem_alerts: low + medium + high + critical,
+            siem_alerts_by_severity: SiemSeverityCounts {
+                low,
+                medium,
+                high,
+                critical,
+            },
         }
     }
 
@@ -548,6 +662,7 @@ fn event_entry(event: &SecurityEvent) -> EventEntry {
             crate::security_event::EventSource::Gateway => "gateway",
             crate::security_event::EventSource::NmapService => "nmap-service",
             crate::security_event::EventSource::UserService => "user-service",
+            crate::security_event::EventSource::Wazuh => "wazuh",
         }
         .to_string(),
         actor_sub: event.actor_sub().map(str::to_string),
@@ -574,9 +689,32 @@ fn critical_finding(event: &SecurityEvent) -> Option<CriticalFinding> {
     })
 }
 
+fn siem_alert(event: &SecurityEvent) -> Option<SiemAlert> {
+    let payload = event.payload();
+    let text = |value: &Value, key: &str| value.get(key)?.as_str().map(str::to_string);
+    let severity = text(payload, "severity").filter(|s| SIEM_SEVERITIES.contains(&s.as_str()))?;
+    let agent = payload.get("agent")?;
+    Some(SiemAlert {
+        event_id: event.event_id().to_string(),
+        occurred_at: event.occurred_at().to_string(),
+        severity,
+        rule_id: text(payload, "rule_id")?,
+        rule_level: u8::try_from(payload.get("rule_level")?.as_u64()?).ok()?,
+        description: text(payload, "description")?,
+        agent: SiemAgent {
+            id: text(agent, "id")?,
+            name: text(agent, "name")?,
+        },
+        src_ip: text(payload, "src_ip"),
+        dest_ip: text(payload, "dest_ip"),
+        signature: text(payload, "signature"),
+    })
+}
+
 /// Agregador de métricas de administración (ver la documentación del módulo).
 pub struct AdminAggregator {
     clock: Arc<dyn Clock>,
+    siem_enabled: bool,
     inner: Mutex<State>,
     deltas: broadcast::Sender<AdminDelta>,
 }
@@ -592,9 +730,17 @@ impl AdminAggregator {
     pub fn new(clock: Arc<dyn Clock>) -> Self {
         Self {
             clock,
+            siem_enabled: false,
             inner: Mutex::new(State::default()),
             deltas: broadcast::channel(DELTA_CHANNEL_CAPACITY).0,
         }
+    }
+
+    /// Activa (o no) la agregación de `siem.alert`; por omisión está apagada.
+    #[must_use]
+    pub fn with_siem_enabled(mut self, enabled: bool) -> Self {
+        self.siem_enabled = enabled;
+        self
     }
 
     /// Instante actual según el reloj inyectado (ms desde la época Unix).
@@ -611,6 +757,9 @@ impl AdminAggregator {
     /// Aplica `event` al estado y emite su [`AdminDelta`]. Un `event_id` ya
     /// visto (reentrega de Kinesis) se ignora.
     pub fn ingest(&self, event: &SecurityEvent) {
+        if event.event_type() == EventType::SiemAlert && !self.siem_enabled {
+            return;
+        }
         let now_ms = self.clock.now_ms();
         let at_ms = event_instant_ms(event, now_ms);
         let mut state = self.lock();
@@ -620,6 +769,7 @@ impl AdminAggregator {
 
         let mut scan_change = None;
         let mut critical = None;
+        let mut siem = None;
         let scan_id = event.scan_id();
         match (event.event_type(), scan_id) {
             (EventType::ScanRequested, Some(id)) => {
@@ -650,6 +800,16 @@ impl AdminAggregator {
                     critical = Some(finding);
                 }
             }
+            (EventType::SiemAlert, _) => {
+                if let Some(alert) = siem_alert(event) {
+                    if let Some(idx) = SIEM_SEVERITIES.iter().position(|s| *s == alert.severity) {
+                        state.siem[idx].add(at_ms, now_ms);
+                    }
+                    state.siem_alerts.push_front(alert.clone());
+                    state.siem_alerts.truncate(MAX_SIEM_ALERTS);
+                    siem = Some(alert);
+                }
+            }
             (EventType::AuthLogin, _) => {
                 if let Some(actor) = event.actor_sub() {
                     state.login(actor, at_ms, now_ms);
@@ -664,25 +824,38 @@ impl AdminAggregator {
             _ => {}
         }
 
-        let severity = match event.event_type() {
-            EventType::FindingCritical => event.payload().get("severity").and_then(Value::as_str),
-            _ => None,
+        let severities = match event.event_type() {
+            EventType::FindingCritical => Severities {
+                finding: event.payload().get("severity").and_then(Value::as_str),
+                siem: None,
+            },
+            EventType::SiemAlert => Severities {
+                finding: None,
+                siem: siem.as_ref().map(|alert| alert.severity.as_str()),
+            },
+            _ => Severities::default(),
         };
         state
             .series
-            .add(at_ms, now_ms, event.event_type_str(), severity);
+            .add(at_ms, now_ms, event.event_type_str(), severities);
 
-        let entry = event_entry(event);
-        state.recent_events.push_front(entry.clone());
-        state.recent_events.truncate(MAX_RECENT_EVENTS);
+        // Un `siem.alert` viaja por su feed y su delta propios: llevarlo
+        // también al registro duplicaría hasta 3 KB por entrada en el frame.
+        let entry = (event.event_type() != EventType::SiemAlert).then(|| {
+            let entry = event_entry(event);
+            state.recent_events.push_front(entry.clone());
+            state.recent_events.truncate(MAX_RECENT_EVENTS);
+            entry
+        });
 
         state.seq += 1;
         let delta = AdminDelta {
             seq: state.seq,
-            event: Some(entry),
+            event: entry,
             kpis: state.kpis(now_ms),
             scan_change,
             critical_finding: critical,
+            siem_alert: siem,
         };
         // Sin receptores `send` devuelve `Err`: nadie escucha ahora mismo.
         let _ = self.deltas.send(delta);
@@ -701,6 +874,7 @@ impl AdminAggregator {
             kpis: state.kpis(now_ms),
             scan_change: None,
             critical_finding: None,
+            siem_alert: None,
         };
         let _ = self.deltas.send(delta);
     }
@@ -730,6 +904,8 @@ impl AdminAggregator {
             critical_findings: state.critical_findings.iter().cloned().collect(),
             recent_events: state.recent_events.iter().cloned().collect(),
             series: state.series.snapshot(now_ms),
+            siem_enabled: self.siem_enabled,
+            siem_alerts: state.siem_alerts.iter().cloned().collect(),
         }
     }
 
@@ -1429,6 +1605,8 @@ mod tests {
             "scans_in_flight",
             "critical_findings",
             "recent_events",
+            "siem_enabled",
+            "siem_alerts",
         ] {
             assert!(value.get(key).is_some(), "falta `{key}`");
         }
@@ -1582,12 +1760,327 @@ mod tests {
             json!({
                 "minute": minute_iso(0),
                 "by_type": {"finding.critical": 1},
-                "findings_by_severity": {"critical": 1}
+                "findings_by_severity": {"critical": 1},
+                "siem_alerts_by_severity": {}
             })
         );
         assert_eq!(
             buckets[0],
-            json!({"minute": minute_iso(-14), "by_type": {}, "findings_by_severity": {}})
+            json!({
+                "minute": minute_iso(-14),
+                "by_type": {},
+                "findings_by_severity": {},
+                "siem_alerts_by_severity": {}
+            })
         );
+    }
+
+    fn siem_aggregator() -> (AdminAggregator, Arc<ManualClock>) {
+        let clock = Arc::new(ManualClock::new(START_MS));
+        (
+            AdminAggregator::new(clock.clone()).with_siem_enabled(true),
+            clock,
+        )
+    }
+
+    fn severity_for(level: u8) -> &'static str {
+        match level {
+            0..=6 => "low",
+            7..=9 => "medium",
+            10..=12 => "high",
+            _ => "critical",
+        }
+    }
+
+    fn siem_payload(level: u8) -> Value {
+        json!({
+            "rule_id": "5710",
+            "rule_level": level,
+            "severity": severity_for(level),
+            "description": "sshd: attempt to login using a non-existent user",
+            "agent": {"id": "001", "name": "lab-target"}
+        })
+    }
+
+    fn siem_event_with(n: u64, payload: Value, occurred_at: &str) -> SecurityEvent {
+        serde_json::from_value(json!({
+            "event_id": format!("00000000-0000-4000-8000-{n:012}"),
+            "event_type": "siem.alert",
+            "occurred_at": occurred_at,
+            "source": "wazuh",
+            "payload": payload,
+        }))
+        .expect("evento siem de prueba válido")
+    }
+
+    fn siem(n: u64, level: u8) -> SecurityEvent {
+        siem_event_with(n, siem_payload(level), &rfc3339_from_ms(START_MS))
+    }
+
+    fn siem_at(n: u64, level: u8, at: &str) -> SecurityEvent {
+        siem_event_with(n, siem_payload(level), at)
+    }
+
+    #[test]
+    fn siem_alerts_kpi_counts_total_and_by_severity_and_expires_with_the_window() {
+        let (agg, clock) = siem_aggregator();
+        for (n, level) in [(1, 3), (2, 8), (3, 11), (4, 12), (5, 14)] {
+            agg.ingest(&siem(n, level));
+        }
+        let kpis = agg.snapshot().kpis;
+        assert_eq!(kpis.siem_alerts, 5);
+        let by = &kpis.siem_alerts_by_severity;
+        assert_eq!((by.low, by.medium, by.high, by.critical), (1, 1, 2, 1));
+
+        clock.advance(Duration::from_secs(WINDOW_SECS + 1));
+        let kpis = agg.snapshot().kpis;
+        assert_eq!(kpis.siem_alerts, 0);
+        assert_eq!(kpis.siem_alerts_by_severity.high, 0);
+    }
+
+    #[test]
+    fn a_replayed_siem_alert_older_than_the_window_reaches_the_feed_but_not_the_kpi() {
+        let (agg, _clock) = siem_aggregator();
+        let old = minutes_from_start(-20);
+        agg.ingest(&siem_at(1, 13, &old));
+        let snapshot = agg.snapshot();
+        assert_eq!(snapshot.kpis.siem_alerts, 0);
+        assert_eq!(snapshot.siem_alerts.len(), 1);
+        assert_eq!(snapshot.siem_alerts[0].occurred_at, old);
+    }
+
+    #[test]
+    fn siem_alert_feed_is_newest_first_and_capped() {
+        let (agg, _clock) = siem_aggregator();
+        for i in 0..(MAX_SIEM_ALERTS as u64 + 5) {
+            agg.ingest(&siem(i, 5));
+        }
+        let feed = agg.snapshot().siem_alerts;
+        assert_eq!(feed.len(), MAX_SIEM_ALERTS);
+        assert_eq!(
+            feed[0].event_id,
+            format!("00000000-0000-4000-8000-{:012}", MAX_SIEM_ALERTS + 4)
+        );
+        assert_eq!(
+            feed[MAX_SIEM_ALERTS - 1].event_id,
+            format!("00000000-0000-4000-8000-{:012}", 5)
+        );
+    }
+
+    #[test]
+    fn siem_alert_feed_keeps_every_severity_for_the_client_filter() {
+        let (agg, _clock) = siem_aggregator();
+        for (n, level) in [(1, 2), (2, 8), (3, 10), (4, 15)] {
+            agg.ingest(&siem(n, level));
+        }
+        let severities: Vec<_> = agg
+            .snapshot()
+            .siem_alerts
+            .iter()
+            .map(|alert| alert.severity.clone())
+            .collect();
+        assert_eq!(severities, ["critical", "high", "medium", "low"]);
+    }
+
+    #[test]
+    fn siem_alert_entries_carry_the_alert_fields_with_null_for_absent_options() {
+        let (agg, _clock) = siem_aggregator();
+        let mut full = siem_payload(12);
+        full["src_ip"] = json!("203.0.113.7");
+        full["dest_ip"] = json!("198.51.100.4");
+        full["signature"] = json!("ET SCAN Potential SSH Scan");
+        agg.ingest(&siem_event_with(1, full, &rfc3339_from_ms(START_MS)));
+        agg.ingest(&siem(2, 5));
+        let value = serde_json::to_value(agg.snapshot()).unwrap();
+        assert_eq!(
+            value["siem_alerts"][1],
+            json!({
+                "event_id": "00000000-0000-4000-8000-000000000001",
+                "occurred_at": rfc3339_from_ms(START_MS),
+                "severity": "high",
+                "rule_id": "5710",
+                "rule_level": 12,
+                "description": "sshd: attempt to login using a non-existent user",
+                "agent": {"id": "001", "name": "lab-target"},
+                "src_ip": "203.0.113.7",
+                "dest_ip": "198.51.100.4",
+                "signature": "ET SCAN Potential SSH Scan"
+            })
+        );
+        let bare = &value["siem_alerts"][0];
+        assert_eq!(bare["src_ip"], Value::Null);
+        assert_eq!(bare["dest_ip"], Value::Null);
+        assert_eq!(bare["signature"], Value::Null);
+    }
+
+    #[test]
+    fn siem_alerts_land_in_the_series_bucket_of_their_minute_by_severity() {
+        let (agg, _clock) = siem_aggregator();
+        agg.ingest(&siem(1, 3));
+        agg.ingest(&siem(2, 14));
+        agg.ingest(&siem(3, 15));
+        agg.ingest(&siem_at(4, 9, &minutes_from_start(-2)));
+        let value = serde_json::to_value(agg.snapshot()).unwrap();
+        let buckets = value["series"]["buckets"].as_array().unwrap();
+        assert_eq!(
+            buckets[14]["siem_alerts_by_severity"],
+            json!({"low": 1, "critical": 2})
+        );
+        assert_eq!(buckets[14]["by_type"]["siem.alert"], 3);
+        assert_eq!(buckets[12]["siem_alerts_by_severity"], json!({"medium": 1}));
+    }
+
+    #[test]
+    fn the_snapshot_says_whether_siem_is_enabled() {
+        let (on, _) = siem_aggregator();
+        let (off, _) = aggregator();
+        assert!(on.snapshot().siem_enabled);
+        assert!(!off.snapshot().siem_enabled);
+        assert_eq!(
+            serde_json::to_value(off.snapshot()).unwrap()["siem_enabled"],
+            json!(false)
+        );
+    }
+
+    #[test]
+    fn with_siem_disabled_alerts_are_ignored_entirely() {
+        let (agg, _clock) = aggregator();
+        let mut rx = agg.subscribe_with_snapshot().1;
+        agg.ingest(&siem(1, 14));
+        let snapshot = agg.snapshot();
+        assert_eq!(snapshot.seq, 0);
+        assert!(snapshot.siem_alerts.is_empty());
+        assert!(snapshot.recent_events.is_empty());
+        assert_eq!(snapshot.kpis.siem_alerts, 0);
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn a_siem_alert_with_an_unusable_payload_is_skipped_without_panicking() {
+        let (agg, _clock) = siem_aggregator();
+        let at = rfc3339_from_ms(START_MS);
+        agg.ingest(&siem_event_with(1, json!({}), &at));
+        let mut odd_severity = siem_payload(5);
+        odd_severity["severity"] = json!("weird");
+        agg.ingest(&siem_event_with(2, odd_severity, &at));
+        let mut no_agent = siem_payload(5);
+        no_agent.as_object_mut().unwrap().remove("agent");
+        agg.ingest(&siem_event_with(3, no_agent, &at));
+        let snapshot = agg.snapshot();
+        assert!(snapshot.siem_alerts.is_empty());
+        assert_eq!(snapshot.kpis.siem_alerts, 0);
+    }
+
+    #[test]
+    fn a_redelivered_siem_alert_counts_once() {
+        let (agg, _clock) = siem_aggregator();
+        agg.ingest(&siem(1, 5));
+        agg.ingest(&siem(1, 5));
+        let snapshot = agg.snapshot();
+        assert_eq!(snapshot.kpis.siem_alerts, 1);
+        assert_eq!(snapshot.siem_alerts.len(), 1);
+    }
+
+    #[test]
+    fn a_delta_carries_the_siem_alert_and_the_updated_kpis() {
+        let (agg, _clock) = siem_aggregator();
+        let (_, mut rx) = agg.subscribe_with_snapshot();
+        agg.ingest(&siem(1, 13));
+        agg.ingest(&login(2, "u"));
+        let first = rx.try_recv().unwrap();
+        let alert = first.siem_alert.as_ref().expect("alerta en el delta");
+        assert_eq!(alert.severity, "critical");
+        assert_eq!(first.kpis.siem_alerts, 1);
+        assert_eq!(first.kpis.siem_alerts_by_severity.critical, 1);
+        let second = rx.try_recv().unwrap();
+        assert!(second.siem_alert.is_none());
+        let value = serde_json::to_value(&second).unwrap();
+        assert_eq!(value["siem_alert"], Value::Null);
+        assert_eq!(value["kpis"]["siem_alerts"], 1);
+    }
+
+    #[test]
+    fn kpis_serialize_the_siem_counts_with_all_four_severities() {
+        let (agg, _clock) = siem_aggregator();
+        agg.ingest(&siem(1, 8));
+        let value = serde_json::to_value(agg.snapshot()).unwrap();
+        assert_eq!(value["siem_enabled"], json!(true));
+        assert_eq!(value["kpis"]["siem_alerts"], 1);
+        assert_eq!(
+            value["kpis"]["siem_alerts_by_severity"],
+            json!({"low": 0, "medium": 1, "high": 0, "critical": 0})
+        );
+    }
+
+    /// Presupuesto del feed SIEM dentro del frame SSE del snapshot: el gateway
+    /// corta el stream si un frame pasa de 64 KiB
+    /// (`gateway/src/events_client.rs`), y el snapshot lleva más feeds.
+    const SIEM_FRAME_BUDGET: usize = 40 * 1024;
+    /// Sobrecarga del frame SSE (`event: snapshot\ndata: ...\n\n`).
+    const SSE_FRAME_OVERHEAD: usize = 32;
+
+    fn worst_case_siem_payload(text: &str) -> Value {
+        let ipv6 = "2001:0db8:85a3:0000:0000:8a2e:0370:7334";
+        json!({
+            "rule_id": "r".repeat(64),
+            "rule_level": 15,
+            "severity": "critical",
+            "description": text.repeat(256),
+            "agent": {"id": "a".repeat(64), "name": text.repeat(128)},
+            "src_ip": ipv6,
+            "dest_ip": ipv6,
+            "signature": text.repeat(256)
+        })
+    }
+
+    #[test]
+    fn a_full_siem_feed_of_worst_case_alerts_fits_the_siem_frame_budget() {
+        // Cuatro bytes por carácter: el peor caso multibyte de UTF-8.
+        let (agg, _clock) = siem_aggregator();
+        for n in 0..(MAX_SIEM_ALERTS as u64 + 1) {
+            agg.ingest(&siem_event_with(
+                n,
+                worst_case_siem_payload("\u{1F6A8}"),
+                &rfc3339_from_ms(START_MS),
+            ));
+        }
+        let snapshot = agg.snapshot();
+        assert_eq!(snapshot.siem_alerts.len(), MAX_SIEM_ALERTS);
+        let siem_only = serde_json::to_string(&snapshot.siem_alerts).unwrap().len();
+        assert!(
+            siem_only + SSE_FRAME_OVERHEAD <= SIEM_FRAME_BUDGET,
+            "el feed SIEM mide {siem_only} bytes, presupuesto {SIEM_FRAME_BUDGET}"
+        );
+    }
+
+    #[test]
+    fn siem_alerts_stay_out_of_the_recent_events_log_and_the_siem_snapshot_fits_the_budget() {
+        // `\u{1}` se escapa como 6 bytes en JSON: el peor caso de tamaño.
+        let (agg, _clock) = siem_aggregator();
+        for n in 0..(MAX_SIEM_ALERTS as u64 + 5) {
+            agg.ingest(&siem_event_with(
+                n,
+                worst_case_siem_payload("\u{1}"),
+                &rfc3339_from_ms(START_MS),
+            ));
+        }
+        let snapshot = agg.snapshot();
+        assert_eq!(snapshot.siem_alerts.len(), MAX_SIEM_ALERTS);
+        assert!(snapshot.recent_events.is_empty());
+        let whole = serde_json::to_string(&snapshot).unwrap().len() + SSE_FRAME_OVERHEAD;
+        assert!(
+            whole <= SIEM_FRAME_BUDGET,
+            "el snapshot solo con SIEM mide {whole} bytes, presupuesto {SIEM_FRAME_BUDGET}"
+        );
+    }
+
+    #[test]
+    fn the_siem_delta_carries_the_alert_but_not_a_recent_events_entry() {
+        let (agg, _clock) = siem_aggregator();
+        let (_, mut rx) = agg.subscribe_with_snapshot();
+        agg.ingest(&siem(1, 12));
+        let delta = rx.try_recv().unwrap();
+        assert!(delta.siem_alert.is_some());
+        assert!(delta.event.is_none());
     }
 }

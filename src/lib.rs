@@ -45,7 +45,13 @@ const CONSUMER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 /// server cannot bind or keeps failing.
 pub async fn run() -> Result<(), RunError> {
     let config = config::Config::from_env()?;
-    let feed = Arc::new(admin::AdminFeed::default());
+    let feed = Arc::new(admin::AdminFeed::new(
+        Arc::new(
+            admin::AdminAggregator::new(Arc::new(admin::SystemClock))
+                .with_siem_enabled(config.siem_enabled),
+        ),
+        admin::DEFAULT_SNAPSHOT_INTERVAL,
+    ));
     let shutdown = CancellationToken::new();
 
     let consumer = wiring::build_consumer(&config, &feed)

@@ -33,7 +33,7 @@ use serde_json::{Map, Value};
 use crate::security_event::SecurityEvent;
 
 /// Tipos de evento del contrato.
-const EVENT_TYPES: [&str; 11] = [
+const EVENT_TYPES: [&str; 12] = [
     "scan.requested",
     "scan.cancelled",
     "scan.started",
@@ -45,8 +45,9 @@ const EVENT_TYPES: [&str; 11] = [
     "ratelimit.hit",
     "message.deadlettered",
     "audit.recorded",
+    "siem.alert",
 ];
-const SOURCES: [&str; 3] = ["gateway", "nmap-service", "user-service"];
+const SOURCES: [&str; 4] = ["gateway", "nmap-service", "user-service", "wazuh"];
 const ENVELOPE_KEYS: [&str; 7] = [
     "event_id",
     "event_type",
@@ -138,6 +139,17 @@ pub fn validate(value: &Value) -> Result<(), &'static str> {
         return Err("falta actor_sub");
     }
 
+    if event_type == "siem.alert" {
+        // D-18: only Wazuh (through the gateway) emits it, and it has no
+        // scan or user behind it.
+        if str_of(envelope, "source") != Some("wazuh") {
+            return Err("source");
+        }
+        if envelope.contains_key("scan_id") || envelope.contains_key("actor_sub") {
+            return Err("siem.alert no lleva scan_id ni actor_sub");
+        }
+    }
+
     let payload = envelope["payload"].as_object().ok_or("payload")?;
     validate_payload(event_type, payload)
 }
@@ -145,8 +157,15 @@ pub fn validate(value: &Value) -> Result<(), &'static str> {
 fn validate_payload(event_type: &str, payload: &Map<String, Value>) -> Result<(), &'static str> {
     match event_type {
         "scan.requested" => {
-            keys(payload, &["target"], &[])?;
-            check(payload, "target", is_ip)
+            keys(payload, &["target"], &["target_host", "scan_mode"])?;
+            check(payload, "target", is_ip)?;
+            if payload.contains_key("target_host") {
+                check(payload, "target_host", is_hostname)?;
+            }
+            if payload.contains_key("scan_mode") {
+                check(payload, "scan_mode", |s| matches!(s, "ssh" | "network"))?;
+            }
+            Ok(())
         }
         "scan.cancelled" => {
             keys(payload, &[], &["target"])?;
@@ -209,8 +228,52 @@ fn validate_payload(event_type: &str, payload: &Map<String, Value>) -> Result<()
             check(payload, "action", is_dotted_code)?;
             check(payload, "resource_type", is_dotted_code)
         }
+        "siem.alert" => validate_siem_alert(payload),
         _ => Err("event_type"),
     }
+}
+
+fn validate_siem_alert(payload: &Map<String, Value>) -> Result<(), &'static str> {
+    keys(
+        payload,
+        &["rule_id", "rule_level", "severity", "description", "agent"],
+        &["src_ip", "dest_ip", "signature"],
+    )?;
+    check(payload, "rule_id", is_wazuh_id)?;
+    uint(payload, "rule_level", 0, 15)?;
+    let expected = match payload["rule_level"].as_u64() {
+        Some(0..=6) => "low",
+        Some(7..=9) => "medium",
+        Some(10..=12) => "high",
+        _ => "critical",
+    };
+    check(payload, "severity", |s| s == expected)?;
+    check(payload, "description", |s| is_text(s, 256))?;
+    let agent = payload["agent"].as_object().ok_or("agent")?;
+    keys(agent, &["id", "name"], &[])?;
+    check(agent, "id", is_wazuh_id)?;
+    check(agent, "name", |s| is_text(s, 128))?;
+    for ip in ["src_ip", "dest_ip"] {
+        if payload.contains_key(ip) {
+            check(payload, ip, is_ip)?;
+        }
+    }
+    if payload.contains_key("signature") {
+        check(payload, "signature", |s| is_text(s, 256))?;
+    }
+    Ok(())
+}
+
+/// `^[A-Za-z0-9_.-]{1,64}$`
+fn is_wazuh_id(s: &str) -> bool {
+    (1..=64).contains(&s.len())
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+}
+
+/// Non-empty text of at most `max` characters.
+fn is_text(s: &str, max: usize) -> bool {
+    (1..=max).contains(&s.chars().count())
 }
 
 /// El objeto tiene todas las claves de `required` y ninguna fuera de
@@ -319,6 +382,19 @@ fn is_ip(s: &str) -> bool {
     } else {
         std::net::Ipv4Addr::from_str(s).is_ok()
     }
+}
+
+/// Hostname of at most 253 characters, labels of 1..=63 alphanumerics and
+/// inner hyphens (`scan-request.schema.json#/properties/target_host`).
+fn is_hostname(s: &str) -> bool {
+    s.len() <= 253
+        && s.split('.').all(|label| {
+            let b = label.as_bytes();
+            (1..=63).contains(&b.len())
+                && b[0].is_ascii_alphanumeric()
+                && b[b.len() - 1].is_ascii_alphanumeric()
+                && b.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'-')
+        })
 }
 
 /// `^CVE-[0-9]{4}-[0-9]{4,}$`
@@ -454,5 +530,77 @@ mod tests {
         assert!(validate(&finding_critical(json!(70000), json!("tcp"))).is_err());
         assert!(validate(&finding_critical(json!("22"), json!("tcp"))).is_err());
         assert!(validate(&finding_critical(json!(22), json!("icmp"))).is_err());
+    }
+
+    fn siem_alert(level: u64, severity: &str) -> Value {
+        json!({
+            "event_id": "3f2b8c1e-5d4a-4e7b-9a10-2c6d8e0f1a10",
+            "event_type": "siem.alert",
+            "occurred_at": "2026-11-09T12:30:00Z",
+            "source": "wazuh",
+            "payload": {
+                "rule_id": "5710", "rule_level": level, "severity": severity,
+                "description": "sshd: attempt to login using a non-existent user",
+                "agent": {"id": "001", "name": "lab-target"},
+                "src_ip": "203.0.113.7"
+            }
+        })
+    }
+
+    #[test]
+    fn siem_alert_accepts_every_level_with_its_severity_band() {
+        for (level, severity) in [
+            (0, "low"),
+            (6, "low"),
+            (7, "medium"),
+            (9, "medium"),
+            (10, "high"),
+            (12, "high"),
+            (13, "critical"),
+            (15, "critical"),
+        ] {
+            assert!(validate(&siem_alert(level, severity)).is_ok(), "{level}");
+        }
+        let event = parse_record(&serde_json::to_vec(&siem_alert(5, "low")).unwrap()).unwrap();
+        assert_eq!(event.event_type_str(), "siem.alert");
+    }
+
+    #[test]
+    fn siem_alert_rejects_a_severity_that_does_not_match_the_level() {
+        assert!(validate(&siem_alert(6, "medium")).is_err());
+        assert!(validate(&siem_alert(10, "medium")).is_err());
+        assert!(validate(&siem_alert(13, "high")).is_err());
+        assert!(validate(&siem_alert(16, "critical")).is_err());
+    }
+
+    #[test]
+    fn siem_alert_requires_the_wazuh_source_and_forbids_scan_and_actor() {
+        let mut other_source = siem_alert(5, "low");
+        other_source["source"] = json!("gateway");
+        assert!(validate(&other_source).is_err());
+        let mut with_scan = siem_alert(5, "low");
+        with_scan["scan_id"] = json!("scan-1");
+        assert!(validate(&with_scan).is_err());
+        let mut with_actor = siem_alert(5, "low");
+        with_actor["actor_sub"] = json!("user-1");
+        assert!(validate(&with_actor).is_err());
+    }
+
+    #[test]
+    fn siem_alert_payload_fields_are_bounded_and_closed() {
+        let bad = |edit: fn(&mut Value)| {
+            let mut v = siem_alert(5, "low");
+            edit(&mut v["payload"]);
+            validate(&v).is_err()
+        };
+        assert!(bad(|p| p["rule_id"] = json!("bad id")));
+        assert!(bad(|p| p["description"] = json!("")));
+        assert!(bad(|p| p["description"] = json!("d".repeat(257))));
+        assert!(bad(|p| p["agent"] = json!({"id": "001"})));
+        assert!(bad(|p| p["agent"]["extra"] = json!(1)));
+        assert!(bad(|p| p["src_ip"] = json!("999.1.1.1")));
+        assert!(bad(|p| p["dest_ip"] = json!("example.com")));
+        assert!(bad(|p| p["signature"] = json!("s".repeat(257))));
+        assert!(bad(|p| p["extra"] = json!(1)));
     }
 }

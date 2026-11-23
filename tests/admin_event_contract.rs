@@ -59,8 +59,8 @@ fn examples() -> Option<Vec<(String, Value)>> {
     out.sort_by(|a, b| a.0.cmp(&b.0));
     assert_eq!(
         out.len(),
-        11,
-        "el contrato tiene un ejemplo por tipo de evento"
+        15,
+        "el contrato tiene al menos un ejemplo por tipo de evento"
     );
     Some(out)
 }
@@ -82,7 +82,8 @@ fn every_broker_example_is_accepted_by_the_consumer_and_updates_the_aggregator()
         })
         .max()
         .unwrap();
-    let aggregator = AdminAggregator::new(Arc::new(ManualClock::new(latest_ms)));
+    let aggregator =
+        AdminAggregator::new(Arc::new(ManualClock::new(latest_ms))).with_siem_enabled(true);
     for (name, example) in &examples {
         let bytes = serde_json::to_vec(example).unwrap();
         let event = parse_record(&bytes)
@@ -92,10 +93,12 @@ fn every_broker_example_is_accepted_by_the_consumer_and_updates_the_aggregator()
     let snapshot = aggregator.snapshot();
     assert_eq!(
         snapshot.recent_events.len(),
-        11,
-        "un evento de registro por ejemplo"
+        13,
+        "un evento de registro por ejemplo, salvo los dos siem.alert (van a su feed)"
     );
     assert_eq!(snapshot.critical_findings.len(), 1);
+    assert_eq!(snapshot.siem_alerts.len(), 2);
+    assert_eq!(snapshot.kpis.siem_alerts, 2);
     assert_eq!(snapshot.kpis.rate_limit_hits, 1);
     assert_eq!(snapshot.kpis.completed_last_window, 1);
     assert_eq!(snapshot.kpis.failed_last_window, 1);
@@ -130,6 +133,7 @@ fn mutations(example: &Value) -> Vec<(String, Value)> {
         json!("3F2B8C1E-5D4A-4E7B-9A10-2C6D8E0F1A06"),
     );
     set("source desconocido", "source", json!("other-service"));
+    set("source wazuh", "source", json!("wazuh"));
     set(
         "occurred_at sin offset",
         "occurred_at",
@@ -177,7 +181,7 @@ fn mutations(example: &Value) -> Vec<(String, Value)> {
         }
     }
     // Valores concretos por campo de payload.
-    let payload_cases: [(&str, Value); 22] = [
+    let payload_cases: [(&str, Value); 42] = [
         ("target", json!("999.1.1.1")),
         ("target", json!("01.2.3.4")),
         ("target", json!("198.51.100.4")),
@@ -200,7 +204,41 @@ fn mutations(example: &Value) -> Vec<(String, Value)> {
         ("queue", json!("has space")),
         ("reason_code", json!("Upper")),
         ("action", json!("user.role_changed")),
+        ("rule_level", json!(6)),
+        ("rule_level", json!(7)),
+        ("rule_level", json!(9)),
+        ("rule_level", json!(10)),
+        ("rule_level", json!(12)),
+        ("rule_level", json!(13)),
+        ("rule_level", json!(15)),
+        ("rule_level", json!(16)),
+        ("severity", json!("medium")),
+        ("severity", json!("high")),
+        ("severity", json!("critical")),
+        ("rule_id", json!("bad id")),
+        ("description", json!("d".repeat(256))),
+        ("description", json!("d".repeat(257))),
+        ("src_ip", json!("2001:db8::1")),
+        ("dest_ip", json!("01.2.3.4")),
+        ("target_host", json!("has space.example")),
+        ("target_host", json!("-lead.example")),
+        ("target_host", json!("a..b")),
+        ("scan_mode", json!("other")),
     ];
+    for agent in [
+        json!({"id": "001"}),
+        json!({"name": "n"}),
+        json!({"id": "001", "name": ""}),
+        json!({"id": "", "name": "n"}),
+        json!({"id": "001", "name": "n".repeat(129)}),
+        json!({"id": "001", "name": "n", "extra": 1}),
+    ] {
+        let mut v = example.clone();
+        if v["payload"].get("agent").is_some() {
+            v["payload"]["agent"] = agent.clone();
+            out.push((format!("payload.agent = {agent}"), v));
+        }
+    }
     for (field, value) in payload_cases {
         let mut v = example.clone();
         if v["payload"].get(field).is_some() {
