@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// Type of a [`SecurityEvent`]; the 11 values of the contract.
+/// Type of a [`SecurityEvent`]; the 12 values of the contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EventType {
     /// A user requested a scan and the broker accepted it.
@@ -43,6 +43,9 @@ pub enum EventType {
     /// `user-service` recorded an audit action.
     #[serde(rename = "audit.recorded")]
     AuditRecorded,
+    /// A SIEM (Wazuh) alert relayed by the gateway.
+    #[serde(rename = "siem.alert")]
+    SiemAlert,
 }
 
 impl EventType {
@@ -60,6 +63,7 @@ impl EventType {
             Self::RatelimitHit => "ratelimit.hit",
             Self::MessageDeadlettered => "message.deadlettered",
             Self::AuditRecorded => "audit.recorded",
+            Self::SiemAlert => "siem.alert",
         }
     }
 }
@@ -76,6 +80,9 @@ pub enum EventSource {
     /// `user-service`.
     #[serde(rename = "user-service")]
     UserService,
+    /// Wazuh, through the gateway relay (`siem.alert` only).
+    #[serde(rename = "wazuh")]
+    Wazuh,
 }
 
 /// Immutable security event: the envelope of the contract.

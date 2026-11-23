@@ -13,6 +13,7 @@ const HTTP_PORT_VAR: &str = "HTTP_PORT";
 const GATEWAY_SHARED_SECRET_VAR: &str = "GATEWAY_SHARED_SECRET";
 const SECURITY_EVENTS_STREAM_NAME_VAR: &str = "SECURITY_EVENTS_STREAM_NAME";
 const AWS_REGION_VAR: &str = "AWS_REGION";
+const SIEM_ENABLED_VAR: &str = "SIEM_ENABLED";
 
 /// Runtime configuration of `events-service`.
 pub struct Config {
@@ -28,6 +29,10 @@ pub struct Config {
     pub security_events_stream_name: Option<String>,
     /// AWS region (`AWS_REGION`). Optional; used by the consumer later.
     pub aws_region: Option<String>,
+    /// Whether the SIEM (`siem.alert`) aggregation is on (`SIEM_ENABLED`,
+    /// default `false`). The admin snapshot reports it so the front shows
+    /// the IDS tab only when on.
+    pub siem_enabled: bool,
 }
 
 impl fmt::Debug for Config {
@@ -41,6 +46,7 @@ impl fmt::Debug for Config {
                 &self.security_events_stream_name,
             )
             .field("aws_region", &self.aws_region)
+            .field("siem_enabled", &self.siem_enabled)
             .finish()
     }
 }
@@ -84,6 +90,7 @@ impl Config {
             gateway_shared_secret,
             security_events_stream_name: read_optional(&lookup, SECURITY_EVENTS_STREAM_NAME_VAR),
             aws_region: read_optional(&lookup, AWS_REGION_VAR),
+            siem_enabled: read_bool(&lookup, SIEM_ENABLED_VAR)?,
         })
     }
 }
@@ -96,6 +103,21 @@ fn read_optional(
         .and_then(|value| value.into_string().ok())
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
+}
+
+/// `true`/`1` or `false`/`0` (case-insensitive); unset or blank is `false`.
+fn read_bool(
+    lookup: &impl Fn(&str) -> Option<OsString>,
+    variable: &'static str,
+) -> Result<bool, ConfigError> {
+    match read_optional(lookup, variable)
+        .map(|value| value.to_ascii_lowercase())
+        .as_deref()
+    {
+        None | Some("false" | "0") => Ok(false),
+        Some("true" | "1") => Ok(true),
+        Some(_) => Err(ConfigError::InvalidBool { variable }),
+    }
 }
 
 fn read_required(
@@ -118,6 +140,12 @@ pub enum ConfigError {
     /// `HTTP_PORT` is not a valid TCP port.
     #[error("environment variable {variable} does not hold a valid TCP port")]
     InvalidPort {
+        /// Name of the invalid variable.
+        variable: &'static str,
+    },
+    /// A boolean variable holds something other than `true`/`false`/`1`/`0`.
+    #[error("environment variable {variable} must be true, false, 1 or 0")]
+    InvalidBool {
         /// Name of the invalid variable.
         variable: &'static str,
     },
@@ -217,6 +245,37 @@ mod tests {
         assert!(
             !rendered.contains(SECRET_VALUE),
             "secret leaked: {rendered}"
+        );
+    }
+
+    #[test]
+    fn siem_is_disabled_by_default() {
+        assert!(!load(&valid_env()).unwrap().siem_enabled);
+    }
+
+    #[test]
+    fn siem_enabled_accepts_true_and_one_case_insensitively() {
+        for value in ["true", "TRUE", " 1 "] {
+            let mut map = valid_env();
+            map.insert("SIEM_ENABLED".into(), value.into());
+            assert!(load(&map).unwrap().siem_enabled, "{value}");
+        }
+        for value in ["false", "0", "  "] {
+            let mut map = valid_env();
+            map.insert("SIEM_ENABLED".into(), value.into());
+            assert!(!load(&map).unwrap().siem_enabled, "{value}");
+        }
+    }
+
+    #[test]
+    fn siem_enabled_rejects_other_values() {
+        let mut map = valid_env();
+        map.insert("SIEM_ENABLED".into(), "maybe".into());
+        assert_eq!(
+            load(&map).unwrap_err(),
+            ConfigError::InvalidBool {
+                variable: "SIEM_ENABLED"
+            }
         );
     }
 }

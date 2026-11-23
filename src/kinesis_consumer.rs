@@ -650,6 +650,49 @@ mod tests {
         );
     }
 
+    fn siem_record(n: u64, level: u64, severity: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "event_id": format!("00000000-0000-4000-8000-{n:012}"),
+            "event_type": "siem.alert",
+            "occurred_at": crate::admin::rfc3339_from_ms(NOW_MS),
+            "source": "wazuh",
+            "payload": {
+                "rule_id": "5710", "rule_level": level, "severity": severity,
+                "description": "sshd: attempt to login using a non-existent user",
+                "agent": {"id": "001", "name": "lab-target"}
+            }
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_valid_siem_alert_is_aggregated_and_a_malformed_one_is_counted() {
+        let source = FakeSource::with_shards(&["shard-1"]);
+        source.push(batch(
+            vec![
+                siem_record(1, 12, "high"),
+                siem_record(2, 12, "low"),
+                b"{\"event_type\":\"siem.alert\"}".to_vec(),
+            ],
+            "it-2",
+        ));
+        let aggregator = Arc::new(
+            AdminAggregator::new(Arc::new(ManualClock::new(NOW_MS))).with_siem_enabled(true),
+        );
+        let shutdown = CancellationToken::new();
+        let consumer = SecurityEventConsumer::new(source, aggregator.clone());
+        let task = tokio::spawn(consumer.run(shutdown.clone()));
+
+        run_for(2).await;
+
+        let snapshot = aggregator.snapshot();
+        assert_eq!(snapshot.kpis.siem_alerts, 1);
+        assert_eq!(snapshot.siem_alerts.len(), 1);
+        assert_eq!(snapshot.kpis.malformed_records, 2);
+        shutdown.cancel();
+        task.await.unwrap();
+    }
+
     #[tokio::test(start_paused = true)]
     async fn an_expired_iterator_reacquires_latest_not_the_warm_start_timestamp() {
         let source = FakeSource::with_shards(&["shard-1"]);
