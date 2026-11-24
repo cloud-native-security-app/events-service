@@ -274,6 +274,43 @@ fn the_consumer_verdict_matches_the_real_schema_on_every_mutation() {
     assert!(checked > 300, "la batería debe ser sustancial ({checked})");
 }
 
+/// Level and severity change together, which the single-field mutations
+/// above cannot do: level 16 (Wazuh custom rules) with its `critical` band
+/// must get the same verdict from the consumer as from the real schema.
+#[test]
+fn the_consumer_verdict_matches_the_real_schema_on_level_and_severity_pairs() {
+    let Some(validator) = schema_validator() else {
+        return;
+    };
+    let Some(examples) = examples() else { return };
+    let pairs = [
+        (12, "high"),
+        (13, "critical"),
+        (16, "critical"),
+        (16, "high"),
+        (17, "critical"),
+    ];
+    let mut checked = 0;
+    for (name, example) in &examples {
+        if example["event_type"] != "siem.alert" {
+            continue;
+        }
+        for (level, severity) in pairs {
+            let mut candidate = example.clone();
+            candidate["payload"]["rule_level"] = serde_json::json!(level);
+            candidate["payload"]["severity"] = serde_json::json!(severity);
+            let schema_says = validator.is_valid(&candidate);
+            let consumer_says = parse_record(&serde_json::to_vec(&candidate).unwrap()).is_ok();
+            assert_eq!(
+                consumer_says, schema_says,
+                "divergencia en {name} [level {level} {severity}]: schema={schema_says}, consumidor={consumer_says}"
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked >= 5, "se esperaba al menos un ejemplo siem.alert");
+}
+
 #[test]
 fn non_json_and_non_object_records_are_rejected_without_echoing_the_body() {
     for body in [&b""[..], b"not json", b"[1,2]", b"null", b"\"text\""] {
