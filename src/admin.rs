@@ -209,7 +209,7 @@ pub struct SiemAlert {
     pub severity: String,
     /// `rule.id` de Wazuh.
     pub rule_id: String,
-    /// `rule.level` de Wazuh (0..15).
+    /// `rule.level` de Wazuh (0..16; el 16 lo reservan las reglas propias).
     pub rule_level: u8,
     /// Descripción de la regla (máx. 256).
     pub description: String,
@@ -1836,6 +1836,16 @@ mod tests {
         let kpis = agg.snapshot().kpis;
         assert_eq!(kpis.siem_alerts, 0);
         assert_eq!(kpis.siem_alerts_by_severity.high, 0);
+    }
+
+    #[test]
+    fn a_level_16_siem_alert_from_a_custom_rule_counts_as_critical_and_reaches_the_feed() {
+        let (agg, _clock) = siem_aggregator();
+        agg.ingest(&siem(1, 16));
+        let snapshot = agg.snapshot();
+        assert_eq!(snapshot.kpis.siem_alerts_by_severity.critical, 1);
+        assert_eq!(snapshot.siem_alerts.len(), 1);
+        assert_eq!(snapshot.siem_alerts[0].rule_level, 16);
     }
 
     #[test]
