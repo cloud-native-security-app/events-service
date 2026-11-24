@@ -240,7 +240,7 @@ fn validate_siem_alert(payload: &Map<String, Value>) -> Result<(), &'static str>
         &["src_ip", "dest_ip", "signature"],
     )?;
     check(payload, "rule_id", is_wazuh_id)?;
-    uint(payload, "rule_level", 0, 15)?;
+    uint(payload, "rule_level", 0, 16)?;
     let expected = match payload["rule_level"].as_u64() {
         Some(0..=6) => "low",
         Some(7..=9) => "medium",
@@ -558,6 +558,7 @@ mod tests {
             (12, "high"),
             (13, "critical"),
             (15, "critical"),
+            (16, "critical"),
         ] {
             assert!(validate(&siem_alert(level, severity)).is_ok(), "{level}");
         }
@@ -570,7 +571,8 @@ mod tests {
         assert!(validate(&siem_alert(6, "medium")).is_err());
         assert!(validate(&siem_alert(10, "medium")).is_err());
         assert!(validate(&siem_alert(13, "high")).is_err());
-        assert!(validate(&siem_alert(16, "critical")).is_err());
+        assert!(validate(&siem_alert(16, "high")).is_err());
+        assert!(validate(&siem_alert(17, "critical")).is_err());
     }
 
     #[test]
